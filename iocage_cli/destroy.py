@@ -125,7 +125,7 @@ def cli(force, release, download, jails, recursive):
                        recursive=recursive)
 
             ioc.IOCage(jail=jail,
-                       skip_jails=True).destroy_jail()
+                       skip_jails=True).destroy_jail(force=force)
     elif jails and release:
         for release in jails:
             if not force:
