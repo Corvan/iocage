@@ -101,7 +101,7 @@ class IOCStart(object):
                 silent=self.silent,
                 exception=ioc_exceptions.JailRunning)
 
-        if self.conf["hostid_strict_check"] == "on":
+        if self.conf['hostid_strict_check']:
             with open("/etc/hostid", "r") as _file:
                 hostid = _file.read().strip()
             if self.conf["hostid"] != hostid:
@@ -148,34 +148,35 @@ class IOCStart(object):
         bpf = self.conf["bpf"]
         dhcp = self.conf["dhcp"]
         rtsold = self.conf['rtsold']
-        wants_dhcp = True if dhcp == 'on' or 'DHCP' in self.conf[
+        wants_dhcp = True if dhcp or 'DHCP' in self.conf[
             'ip4_addr'].upper() else False
         vnet_interfaces = self.conf["vnet_interfaces"]
         ip6_addr = self.conf["ip6_addr"]
+        ip_hostname = self.conf['ip_hostname']
         prop_missing = False
         prop_missing_msgs = []
 
         if wants_dhcp:
-            if bpf != "yes":
+            if not bpf:
                 prop_missing_msgs.append(
-                    f"{self.uuid}: dhcp requires bpf=yes!"
+                    f"{self.uuid}: dhcp requires bpf!"
                 )
                 prop_missing = True
-            elif self.conf["vnet"] != "on":
+            elif not self.conf['vnet']:
                 # We are already setting a vnet variable below.
                 prop_missing_msgs.append(
-                    f"{self.uuid}: dhcp requires vnet=on!"
+                    f"{self.uuid}: dhcp requires vnet!"
                 )
                 prop_missing = True
 
-        if 'accept_rtadv' in ip6_addr and self.conf['vnet'] != 'on':
+        if 'accept_rtadv' in ip6_addr and not self.conf['vnet']:
             prop_missing_msgs.append(
-                f'{self.uuid}: accept_rtadv requires vnet=on!'
+                f'{self.uuid}: accept_rtadv requires vnet!'
             )
             prop_missing = True
 
-        if bpf == 'yes' and self.conf['vnet'] != 'on':
-            prop_missing_msgs.append(f'{self.uuid}: bpf requires vnet=on!')
+        if bpf and not self.conf['vnet']:
+            prop_missing_msgs.append(f'{self.uuid}: bpf requires vnet!')
             prop_missing = True
 
         if prop_missing:
@@ -188,10 +189,10 @@ class IOCStart(object):
         if wants_dhcp:
             self.__check_dhcp__()
 
-        if rtsold == 'on':
+        if rtsold:
             self.__check_rtsold__()
 
-        if mount_procfs == "1":
+        if mount_procfs:
             su.Popen(
                 [
                     'mount', '-t', 'procfs', 'proc', f'{self.path}/root/proc'
@@ -201,7 +202,7 @@ class IOCStart(object):
         try:
             mount_linprocfs = self.conf["mount_linprocfs"]
 
-            if mount_linprocfs == "1":
+            if mount_linprocfs:
                 if not os.path.isdir(f"{self.path}/root/compat/linux/proc"):
                     os.makedirs(f"{self.path}/root/compat/linux/proc", 0o755)
                 su.Popen(
@@ -213,7 +214,7 @@ class IOCStart(object):
         except Exception:
             pass
 
-        if self.conf["jail_zfs"] == "on":
+        if self.conf['jail_zfs']:
             allow_mount = "1"
             enforce_statfs = enforce_statfs if enforce_statfs != "2" \
                 else "1"
@@ -274,7 +275,7 @@ class IOCStart(object):
             _allow_mount_fusefs = f"allow.mount.fusefs={allow_mount_fusefs}"
             _allow_vmm = f"allow.vmm={allow_vmm}"
 
-        if self.conf['vnet'] == 'off':
+        if not self.conf['vnet']:
             ip4_addr = self.conf['ip4_addr']
             ip4_saddrsel = self.conf['ip4_saddrsel']
             ip4 = self.conf['ip4']
@@ -392,6 +393,7 @@ class IOCStart(object):
                 'allow.dying',
                 f'exec.consolelog={self.iocroot}/log/ioc-'
                 f'{self.uuid}-console.log',
+                f'ip_hostname={ip_hostname}' if ip_hostname else '',
                 'persist'
             ] if x != '']
 
@@ -486,7 +488,7 @@ class IOCStart(object):
             },
                 _callback=self.callback)
 
-        if self.conf["jail_zfs"] == "on":
+        if self.conf['jail_zfs']:
             for jdataset in self.conf["jail_zfs_dataset"].split():
                 jdataset = jdataset.strip()
                 children = iocage_lib.ioc_common.checkoutput(
@@ -654,6 +656,38 @@ class IOCStart(object):
                 _callback=self.callback,
                 silent=self.silent)
 
+        rctl_keys = set(
+            filter(
+                lambda k: self.conf.get(k, 'off') != 'off',
+                iocage_lib.ioc_json.IOCRCTL.types
+            )
+        )
+        if rctl_keys:
+
+            # We should remove any rules specified for this jail for just in
+            # case cases
+            rctl_jail = iocage_lib.ioc_json.IOCRCTL(self.uuid)
+            rctl_jail.validate_rctl_tunable()
+
+            rctl_jail.remove_rctl_rules()
+
+            # Let's set the specified rules
+            iocage_lib.ioc_common.logit({
+                'level': 'INFO',
+                'message': f'  + Setting RCTL props'
+            })
+
+            failed = rctl_jail.set_rctl_rules(
+                [(k, self.conf[k]) for k in rctl_keys]
+            )
+
+            if failed:
+                iocage_lib.ioc_common.logit({
+                    'level': 'INFO',
+                    'message': f'  + Failed to set {", ".join(failed)} '
+                    'RCTL props'
+                })
+
         self.set(
             "last_started={}".format(datetime.datetime.utcnow().strftime(
                 "%F %T")))
@@ -755,13 +789,13 @@ class IOCStart(object):
 
             try:
                 membermtu = self.find_bridge_mtu(bridge)
-                dhcp = self.get("dhcp")
+                dhcp = self.get('dhcp')
 
                 ifaces = []
 
                 for addrs, gw, ipv6 in net_configs:
                     if (
-                        dhcp == "on" or 'DHCP' in self.get('ip4_addr').upper()
+                        dhcp or 'DHCP' in self.get('ip4_addr').upper()
                     ) and 'accept_rtadv' not in addrs:
                         # Spoofing IP address, it doesn't matter with DHCP
                         addrs = f"{nic}|''"
@@ -916,7 +950,7 @@ class IOCStart(object):
         :return: If an error occurs it returns the error. Otherwise, it's None
         """
         dhcp = self.get('dhcp')
-        wants_dhcp = True if dhcp == 'on' or 'DHCP' in self.get(
+        wants_dhcp = True if dhcp or 'DHCP' in self.get(
             'ip4_addr').upper() else False
 
         if 'vnet' in iface:
@@ -958,7 +992,7 @@ class IOCStart(object):
         host_time = self.get("host_time")
         file = f"{self.path}/root/etc/localtime"
 
-        if host_time != "yes":
+        if not iocage_lib.ioc_common.check_truthy(host_time):
             return
 
         if os.path.isfile(file):
@@ -1028,7 +1062,7 @@ class IOCStart(object):
 
     def __check_dhcp__(self):
         # legacy behavior to enable it on every NIC
-        if self.conf['dhcp'] == 'on':
+        if self.conf['dhcp']:
             nic_list = self.get('interfaces').split(',')
             nics = list(map(lambda x: x.split(':')[0], nic_list))
         else:
@@ -1097,11 +1131,11 @@ class IOCStart(object):
 
     def find_bridge_mtu(self, bridge):
         if self.unit_test:
-            dhcp = 'off'
+            dhcp = 0
             wants_dhcp = False
         else:
-            dhcp = self.get("dhcp")
-            wants_dhcp = True if dhcp == 'on' or 'DHCP' in self.get(
+            dhcp = self.get('dhcp')
+            wants_dhcp = True if dhcp or 'DHCP' in self.get(
                 'ip4_addr').upper() else False
 
         try:

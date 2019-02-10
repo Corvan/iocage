@@ -22,6 +22,7 @@
 # IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 """The main CLI for ioc."""
+
 import locale
 import logging
 import logging.config
@@ -39,8 +40,7 @@ import iocage_lib.ioc_check as ioc_check
 from click import core
 
 core._verify_python3_env = lambda: None
-user_locale = os.environ.get("LANG", "en_US.UTF-8")
-locale.setlocale(locale.LC_ALL, user_locale)
+locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
 
 # @formatter:off
 # Sometimes SIGINT won't be installed.
@@ -63,7 +63,7 @@ def print_version(ctx, param, value):
 
     if not value or ctx.resilient_parsing:
         return
-    print("Version\t1.1 RELEASE 2019/01")
+    print("Version\t1.2 BETA")
     sys.exit()
 
 

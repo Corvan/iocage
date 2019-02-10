@@ -188,7 +188,7 @@ class IOCage(ioc_json.IOCZFS):
 
             # This removes having to grab all the JSON again later.
 
-            if boot == 'on':
+            if boot:
                 boot_order[jail] = int(priority)
 
             jail_order = collections.OrderedDict(
@@ -645,7 +645,14 @@ class IOCage(ioc_json.IOCZFS):
                     clone=clone,
                     thickconfig=thickconfig
                 ).create_jail()
-        except RuntimeError:
+        except BaseException:
+            if clone:
+                su.run(
+                    [
+                        'zfs', 'destroy', '-r',
+                        f'{self.pool}/iocage/jails/{clone}@{_uuid}'
+                    ]
+                )
             raise
 
         return False, None
@@ -823,7 +830,7 @@ class IOCage(ioc_json.IOCZFS):
         uuid, path = self.__check_jail_existence__()
         exec_clean = self.get('exec_clean')
 
-        if exec_clean == '1':
+        if exec_clean:
             env_path = '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:' \
                 '/usr/local/bin:/root/bin'
             env_lang = os.environ.get('LANG', 'en_US.UTF-8')
@@ -843,7 +850,7 @@ class IOCage(ioc_json.IOCZFS):
             ip6_addr = self.get("ip6_addr")
             dhcp = self.get("dhcp")
 
-            if ip4_addr == "none" and ip6_addr == "none" and dhcp != "on":
+            if ip4_addr == "none" and ip6_addr == "none" and not dhcp:
                 ioc_common.logit(
                     {
                         "level":
@@ -1009,7 +1016,11 @@ class IOCage(ioc_json.IOCZFS):
 
                 return rel_list
 
-            if not ip and "dhcp=on" not in props:
+            if not ip and (not set(
+                ioc_common.construct_truthy('dhcp')
+            ) & set(props) and not set(
+                ioc_common.construct_truthy('ip_hostname')
+            ) & set(props)):
                 ioc_common.logit(
                     {
                         "level":
@@ -1460,7 +1471,7 @@ class IOCage(ioc_json.IOCZFS):
                 _callback=self.callback,
                 silent=self.silent)
 
-        if conf["template"] == "yes":
+        if ioc_common.check_truthy(conf['template']):
             target = f"{self.pool}/iocage/templates/{uuid}"
         else:
             target = f"{self.pool}/iocage/jails/{uuid}"
@@ -1558,9 +1569,11 @@ class IOCage(ioc_json.IOCZFS):
             return
 
         if "template" in key:
-            if prop == "template=yes" and path.startswith(
-                    f"{self.iocroot}/templates/"):
-
+            if prop in ioc_common.construct_truthy(
+                'template'
+            ) and path.startswith(
+                f'{self.iocroot}/templates/'
+            ):
                 ioc_common.logit(
                     {
                         "level": "EXCEPTION",
@@ -1569,9 +1582,11 @@ class IOCage(ioc_json.IOCZFS):
                     _callback=self.callback,
                     silent=self.silent)
 
-            elif prop == "template=no" and path.startswith(
-                    f"{self.iocroot}/jails/"):
-
+            elif prop in ioc_common.construct_truthy(
+                'template', inverse=True
+            ) and path.startswith(
+                f'{self.iocroot}/jails/'
+            ):
                 ioc_common.logit(
                     {
                         "level": "EXCEPTION",
@@ -1609,7 +1624,7 @@ class IOCage(ioc_json.IOCZFS):
         snap_list_temp = []
         snap_list_root = []
 
-        if conf["template"] == "yes":
+        if ioc_common.check_truthy(conf['template']):
             full_path = f"{self.pool}/iocage/templates/{uuid}"
         else:
             full_path = f"{self.pool}/iocage/jails/{uuid}"
@@ -1675,7 +1690,7 @@ class IOCage(ioc_json.IOCZFS):
         # Looks like foo/iocage/jails/df0ef69a-57b6-4480-b1f8-88f7b6febbdf@BAR
         conf = ioc_json.IOCJson(path, silent=self.silent).json_get_value('all')
 
-        if conf["template"] == "yes":
+        if ioc_common.check_truthy(conf['template']):
             target = f"{self.pool}/iocage/templates/{uuid}"
         else:
             target = f"{self.pool}/iocage/jails/{uuid}"
@@ -1853,6 +1868,8 @@ class IOCage(ioc_json.IOCZFS):
             "jail", "clonejail", "pluginv2") else False
 
         if updateable:
+            self.snapshot(f'ioc_update_{conf["release"]}')
+
             if not status:
                 self.silent = True
                 self.start()
@@ -1897,8 +1914,8 @@ class IOCage(ioc_json.IOCZFS):
                 ioc_plugin.IOCPlugin(
                     plugin=uuid,
                     callback=self.callback
-                ).update()
-            elif conf["basejail"] != "yes":
+                ).update(jid)
+            elif not ioc_common.check_truthy(conf['basejail']):
                 new_release = ioc_fetch.IOCFetch(
                     release,
                     callback=self.callback
@@ -1996,7 +2013,7 @@ class IOCage(ioc_json.IOCZFS):
                 ioc_start.IOCStart(uuid, path, silent=True)
                 started = True
 
-            if conf["basejail"] == "yes":
+            if ioc_common.check_truthy(conf['basejail']):
                 new_release = ioc_upgrade.IOCUpgrade(
                     release,
                     root_path,
@@ -2037,7 +2054,7 @@ class IOCage(ioc_json.IOCZFS):
             new_release = ioc_plugin.IOCPlugin(
                 plugin=uuid,
                 callback=self.callback
-            ).upgrade()
+            ).upgrade(jid)
             plugin = True
         else:
             ioc_common.logit(
@@ -2085,7 +2102,7 @@ Remove the snapshot: ioc_upgrade_{_date} if everything is OK
         uuid, path = self.__check_jail_existence__()
         conf = ioc_json.IOCJson(path, silent=self.silent).json_get_value('all')
 
-        if conf['template'] == 'yes':
+        if ioc_common.check_truthy(conf['template']):
             target = f'{self.pool}/iocage/templates/{uuid}@{snapshot}'
         else:
             target = f'{self.pool}/iocage/jails/{uuid}@{snapshot}'

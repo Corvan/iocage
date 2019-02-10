@@ -706,38 +706,39 @@ class IOCFetch(iocage_lib.ioc_json.IOCZFS):
                     last_progress = 0
 
                     for i, chunk in enumerate(
-                            r.iter_content(chunk_size=chunk_size), 1):
-                            if chunk:
-                                elapsed = time.time() - start
-                                dl_progress += len(chunk)
-                                txz.write(chunk)
+                        r.iter_content(chunk_size=chunk_size), 1
+                    ):
+                        if chunk:
+                            elapsed = time.time() - start
+                            dl_progress += len(chunk)
+                            txz.write(chunk)
 
-                                progress = float(i) / float(total)
-                                if progress >= 1.:
-                                    progress = 1
-                                progress = round(progress * 100, 0)
+                            progress = float(i) / float(total)
+                            if progress >= 1.:
+                                progress = 1
+                            progress = round(progress * 100, 0)
 
-                                if progress != last_progress:
-                                    text = self.update_progress(
-                                        progress,
-                                        f'Downloading: {f}',
-                                        elapsed,
-                                        chunk_size
-                                    )
+                            if progress != last_progress:
+                                text = self.update_progress(
+                                    progress,
+                                    f'Downloading: {f}',
+                                    elapsed,
+                                    chunk_size
+                                )
 
-                                    if progress % 10 == 0:
-                                        # Not for user output, but for callback
-                                        # heartbeats
-                                        iocage_lib.ioc_common.logit(
-                                            {
-                                                'level': 'INFO',
-                                                'message': text.rstrip()
-                                            },
-                                            _callback=self.callback,
-                                            silent=True)
+                                if progress % 10 == 0:
+                                    # Not for user output, but for callback
+                                    # heartbeats
+                                    iocage_lib.ioc_common.logit(
+                                        {
+                                            'level': 'INFO',
+                                            'message': text.rstrip()
+                                        },
+                                        _callback=self.callback,
+                                        silent=True)
 
-                                last_progress = progress
-                                start = time.time()
+                            last_progress = progress
+                            start = time.time()
 
     def update_progress(self, progress, display_text, elapsed, chunk_size):
         """
@@ -955,10 +956,9 @@ class IOCFetch(iocage_lib.ioc_json.IOCZFS):
                 _json = iocage_lib.ioc_json.IOCJson(path)
                 props = _json.json_get_value('all')
 
-                if props.get('basejail', 'no') == 'yes':
-                    if props['release'] == self.release:
-                        props['release'] = new_release
-                        _json.json_write(props)
+                if props['basejail'] and props['release'] == self.release:
+                    props['release'] = new_release
+                    _json.json_write(props)
 
         return new_release
 
