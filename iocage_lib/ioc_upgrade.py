@@ -80,8 +80,6 @@ class IOCUpgrade(iocage_lib.ioc_json.IOCZFS):
         }
 
         self.callback = callback
-        # Work around for https://github.com/freebsd/freebsd/commit/bffa924f
-        os.environ['UNAME_r'] = self.jail_release
 
     def upgrade_jail(self):
         tmp_dataset = self.zfs_get_dataset_name('/tmp')
@@ -353,12 +351,12 @@ class IOCUpgrade(iocage_lib.ioc_json.IOCZFS):
                 unjailed=True,
                 callback=self.callback,
             ) as _exec:
-                update_output = iocage_lib.ioc_common.consume_and_log(
+                output = iocage_lib.ioc_common.consume_and_log(
                     _exec,
                     callback=self.callback
                 )
 
-            for i in update_output:
+            for i in output['stdout']:
                 if i == 'No updates are available to install.':
                     return True
 

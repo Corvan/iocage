@@ -38,6 +38,7 @@ import requests.packages.urllib3.exceptions
 
 import iocage_lib.ioc_common
 import iocage_lib.ioc_destroy
+import iocage_lib.ioc_exceptions
 import iocage_lib.ioc_exec
 import iocage_lib.ioc_json
 import iocage_lib.ioc_start
@@ -706,38 +707,39 @@ class IOCFetch(iocage_lib.ioc_json.IOCZFS):
                     last_progress = 0
 
                     for i, chunk in enumerate(
-                            r.iter_content(chunk_size=chunk_size), 1):
-                            if chunk:
-                                elapsed = time.time() - start
-                                dl_progress += len(chunk)
-                                txz.write(chunk)
+                        r.iter_content(chunk_size=chunk_size), 1
+                    ):
+                        if chunk:
+                            elapsed = time.time() - start
+                            dl_progress += len(chunk)
+                            txz.write(chunk)
 
-                                progress = float(i) / float(total)
-                                if progress >= 1.:
-                                    progress = 1
-                                progress = round(progress * 100, 0)
+                            progress = float(i) / float(total)
+                            if progress >= 1.:
+                                progress = 1
+                            progress = round(progress * 100, 0)
 
-                                if progress != last_progress:
-                                    text = self.update_progress(
-                                        progress,
-                                        f'Downloading: {f}',
-                                        elapsed,
-                                        chunk_size
-                                    )
+                            if progress != last_progress:
+                                text = self.update_progress(
+                                    progress,
+                                    f'Downloading: {f}',
+                                    elapsed,
+                                    chunk_size
+                                )
 
-                                    if progress % 10 == 0:
-                                        # Not for user output, but for callback
-                                        # heartbeats
-                                        iocage_lib.ioc_common.logit(
-                                            {
-                                                'level': 'INFO',
-                                                'message': text.rstrip()
-                                            },
-                                            _callback=self.callback,
-                                            silent=True)
+                                if progress % 10 == 0:
+                                    # Not for user output, but for callback
+                                    # heartbeats
+                                    iocage_lib.ioc_common.logit(
+                                        {
+                                            'level': 'INFO',
+                                            'message': text.rstrip()
+                                        },
+                                        _callback=self.callback,
+                                        silent=True)
 
-                                last_progress = progress
-                                start = time.time()
+                            last_progress = progress
+                            start = time.time()
 
     def update_progress(self, progress, display_text, elapsed, chunk_size):
         """
@@ -907,24 +909,70 @@ class IOCFetch(iocage_lib.ioc_json.IOCZFS):
                 callback=self.callback,
                 su_env=fetch_env
             ) as _exec:
-                iocage_lib.ioc_common.consume_and_log(
-                    _exec, callback=self.callback)
+                try:
+                    iocage_lib.ioc_common.consume_and_log(
+                        _exec, callback=self.callback)
+                except iocage_lib.ioc_exceptions.CommandFailed as e:
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'EXCEPTION',
+                            'message': b''.join(e.message)
+                        },
+                        _callback=self.callback,
+                        silent=self.silent
+                    )
 
-            fetch_install_cmd = [
-                fetch_name, "-b", mount_root, "-d",
-                f"{mount_root}/var/db/freebsd-update/", "-f",
-                f"{mount_root}/etc/freebsd-update.conf", "install"
-            ]
-            with iocage_lib.ioc_exec.IOCExec(
-                fetch_install_cmd,
-                f"{self.iocroot}/jails/{uuid}",
-                uuid=uuid,
-                unjailed=True,
-                callback=self.callback,
-                su_env=fetch_env
-            ) as _exec:
-                iocage_lib.ioc_common.consume_and_log(
-                    _exec, callback=self.callback)
+            try:
+                fetch_install_cmd = [
+                    fetch_name, "-b", mount_root, "-d",
+                    f"{mount_root}/var/db/freebsd-update/", "-f",
+                    f"{mount_root}/etc/freebsd-update.conf", "install"
+                ]
+                with iocage_lib.ioc_exec.IOCExec(
+                    fetch_install_cmd,
+                    f"{self.iocroot}/jails/{uuid}",
+                    uuid=uuid,
+                    unjailed=True,
+                    callback=self.callback,
+                    su_env=fetch_env
+                ) as _exec:
+                    try:
+                        iocage_lib.ioc_common.consume_and_log(
+                            _exec, callback=self.callback)
+                    except iocage_lib.ioc_exceptions.CommandFailed as e:
+                        iocage_lib.ioc_common.logit(
+                            {
+                                'level': 'EXCEPTION',
+                                'message': b''.join(e.message)
+                            },
+                            _callback=self.callback,
+                            silent=self.silent
+                        )
+
+            finally:
+                new_release = iocage_lib.ioc_common.get_jail_freebsd_version(
+                    mount_root, self.release
+                )
+
+                if self.release != new_release:
+                    jails = iocage_lib.ioc_list.IOCList(
+                        'uuid', hdr=False).list_datasets()
+
+                    if not cli:
+                        for jail, path in jails.items():
+                            _json = iocage_lib.ioc_json.IOCJson(path)
+                            props = _json.json_get_value('all')
+
+                            if props['basejail'] and self.release.rsplit(
+                                '-', 1
+                            )[0] in props['release']:
+                                props['release'] = new_release
+                                _json.json_write(props)
+                    else:
+                        _json = iocage_lib.ioc_json.IOCJson(jails[uuid])
+                        props = _json.json_get_value('all')
+                        props['release'] = new_release
+                        _json.json_write(props)
 
             if self.verify:
                 # tmp only exists if they verify SSL certs
@@ -942,25 +990,6 @@ class IOCFetch(iocage_lib.ioc_json.IOCZFS):
             pass
 
         su.Popen(["umount", f"{mount_root}/dev"]).communicate()
-
-        new_release = iocage_lib.ioc_common.get_jail_freebsd_version(
-            mount_root, self.release
-        )
-
-        if self.release != new_release:
-            jails = iocage_lib.ioc_list.IOCList(
-                'uuid', hdr=False).list_datasets()
-
-            for jail, path in jails.items():
-                _json = iocage_lib.ioc_json.IOCJson(path)
-                props = _json.json_get_value('all')
-
-                if props.get('basejail', 'no') == 'yes':
-                    if props['release'] == self.release:
-                        props['release'] = new_release
-                        _json.json_write(props)
-
-        return new_release
 
     def __fetch_extract_remove__(self, tar):
         """

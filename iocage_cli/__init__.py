@@ -22,6 +22,7 @@
 # IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 """The main CLI for ioc."""
+
 import locale
 import logging
 import logging.config
@@ -37,10 +38,14 @@ import coloredlogs
 import iocage_lib.ioc_check as ioc_check
 # This prevents it from getting in our way.
 from click import core
+from iocage_lib.ioc_common import set_interactive
 
 core._verify_python3_env = lambda: None
-user_locale = os.environ.get("LANG", "en_US.UTF-8")
-locale.setlocale(locale.LC_ALL, user_locale)
+locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+
+sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf8', buffering=1)
+sys.stderr = open(sys.stderr.fileno(), mode='w', encoding='utf8', buffering=1)
+set_interactive(True)
 
 # @formatter:off
 # Sometimes SIGINT won't be installed.
@@ -63,7 +68,7 @@ def print_version(ctx, param, value):
 
     if not value or ctx.resilient_parsing:
         return
-    print("Version\t1.1 RELEASE 2019/01")
+    print("Version\t1.2 RC")
     sys.exit()
 
 
@@ -90,10 +95,10 @@ class IOCLogger(object):
             # a large duplicate flood of text.
             logger.handlers = []
 
-        logger.setLevel(logging.DEBUG)
         logging.addLevelName(5, "SPAM")
         logging.addLevelName(15, "VERBOSE")
         logging.addLevelName(25, "NOTICE")
+        logger.setLevel('VERBOSE')
 
         default_logging = {
             'version': 1,
@@ -148,6 +153,10 @@ class IOCLogger(object):
             level_styles=cli_colors))
         logger.addHandler(handler)
 
+    def setConsoleLogLevel(self, level):
+        logger = logging.getLogger("iocage")
+        logger.setLevel(level)
+
 
 cmd_folder = os.path.abspath(os.path.dirname(__file__))
 
@@ -170,23 +179,25 @@ class IOCageCLI(click.MultiCommand):
         return rv
 
     def get_command(self, ctx, name):
+
         try:
             mod = __import__(f"iocage_cli.{name}", None, None, ["cli"])
             mod_name = mod.__name__.replace("iocage_cli.", "")
-
-            try:
-                if mod.__rootcmd__ and sys.argv[-1] not in ("help", "--help"):
-                    if len(sys.argv) != 1:
-                        if os.geteuid() != 0:
-                            sys.exit("You need to have root privileges to"
-                                     f" run {mod_name}")
-            except AttributeError:
-                # It's not a root required command.
-                pass
-
-            return mod.cli
-        except (ImportError, AttributeError):
+        except ImportError:
+            # No such command
             return
+
+        try:
+            if mod.__rootcmd__ and sys.argv[-1] not in ("help", "--help"):
+                if len(sys.argv) != 1:
+                    if os.geteuid() != 0:
+                        sys.exit("You need to have root privileges to"
+                                 f" run {mod_name}")
+        except AttributeError:
+            # It's not a root required command.
+            pass
+
+        return mod.cli
 
 
 @click.command(cls=IOCageCLI)
@@ -201,9 +212,20 @@ class IOCageCLI(click.MultiCommand):
     "-f",
     is_flag=True,
     help="Allow iocage to rename datasets.")
-def cli(version, force):
+@click.option(
+    "--debug",
+    "-D",
+    is_flag=True,
+    help="Log debug output to the console.")
+def cli(version, force, debug):
     """A jail manager."""
-    IOCLogger()
+    os.environ['IOCAGE_DEBUG'] = 'FALSE'
+    logger = IOCLogger()
+
+    if debug:
+        os.environ['IOCAGE_DEBUG'] = 'TRUE'
+        logger.setConsoleLogLevel(logging.DEBUG)
+
     skip_check = False
     os.environ["IOCAGE_SKIP"] = "FALSE"
     skip_check_cmds = ["--help", "activate", "-v", "--version", "--rc"]

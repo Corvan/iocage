@@ -23,6 +23,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 """iocage create module."""
 import json
+import logging
 import os
 import pathlib
 import re
@@ -38,7 +39,6 @@ import iocage_lib.ioc_start
 import iocage_lib.ioc_stop
 import iocage_lib.ioc_exceptions
 import libzfs
-import itertools
 import dns.resolver
 import dns.exception
 import shutil
@@ -51,7 +51,8 @@ class IOCCreate(object):
     def __init__(self, release, props, num, pkglist=None, plugin=False,
                  migrate=False, config=None, silent=False, template=False,
                  short=False, basejail=False, thickjail=False, empty=False,
-                 uuid=None, clone=False, thickconfig=False, callback=None):
+                 uuid=None, clone=False, thickconfig=False,
+                 clone_basejail=False, callback=None):
         self.pool = iocage_lib.ioc_json.IOCJson().json_get_value("pool")
         self.iocroot = iocage_lib.ioc_json.IOCJson(self.pool).json_get_value(
             "iocroot")
@@ -73,6 +74,11 @@ class IOCCreate(object):
         self.callback = callback
         self.zfs = libzfs.ZFS(history=True, history_prefix="<iocage>")
         self.thickconfig = thickconfig
+        self.log = logging.getLogger('iocage')
+
+        if basejail and not clone_basejail:
+            # We want these thick to remove any odd dependency chains later
+            self.thickjail = True
 
     def create_jail(self):
         """Helper to catch SIGINT"""
@@ -113,22 +119,10 @@ class IOCCreate(object):
         rtsold_enable = 'NO'
 
         if iocage_lib.ioc_common.match_to_dir(self.iocroot, jail_uuid):
-            if not self.plugin:
-                iocage_lib.ioc_common.logit({
-                    'level': 'EXCEPTION',
-                    'message': f'Jail: {jail_uuid} already exists!'
-                })
-
-            for i in itertools.count(start=2, step=1):
-                if iocage_lib.ioc_common.match_to_dir(self.iocroot,
-                                                      f'{jail_uuid}_{i}'):
-                    continue
-
-                # They now have a uniquely named plugin
-                jail_uuid = f'{jail_uuid}_{i}'
-                location = f'{location}_{i}'
-                self.uuid = jail_uuid
-                break
+            iocage_lib.ioc_common.logit({
+                'level': 'EXCEPTION',
+                'message': f'Jail: {jail_uuid} already exists!'
+            })
 
         if self.migrate:
             config = self.config
@@ -310,11 +304,15 @@ class IOCCreate(object):
             # Clones are expected to be as identical as possible.
 
             for k, v in config.items():
-                v = v.replace(clone_uuid, jail_uuid)
+                try:
+                    v = v.replace(clone_uuid, jail_uuid)
 
-                if '_mac' in k:
-                    # They want a unique mac on start
-                    config[k] = 'none'
+                    if '_mac' in k:
+                        # They want a unique mac on start
+                        config[k] = 'none'
+                except AttributeError:
+                    # Bool props
+                    pass
 
                 config[k] = v
         else:
@@ -372,19 +370,21 @@ class IOCCreate(object):
                 _callback=self.callback,
                 silent=self.silent)
 
+        disable_localhost = False
         for prop in self.props:
             key, _, value = prop.partition("=")
+            is_true = iocage_lib.ioc_common.check_truthy(value)
 
-            if key == "boot" and value == "on" and not self.empty:
+            if key == "boot" and is_true and not self.empty:
                 start = True
             elif self.plugin and key == "type" and value == "pluginv2":
                 config["type"] = value
-            elif key == "template" and value == "yes":
+            elif key == 'template' and is_true:
                 iocjson.json_write(config)  # Set counts on this.
                 location = location.replace("/jails/", "/templates/")
 
                 iocjson.json_set_value("type=template")
-                iocjson.json_set_value("template=yes")
+                iocjson.json_set_value("template=1")
                 iocjson.zfs_set_property(f"{self.pool}/iocage/templates/"
                                          f"{jail_uuid}", "readonly", "off")
 
@@ -396,49 +396,97 @@ class IOCCreate(object):
                 is_template = True
             elif key == 'ip6_addr':
                 if 'accept_rtadv' in value:
-                    if 'vnet=on' not in self.props:
+                    if not iocage_lib.ioc_common.lowercase_set(
+                        iocage_lib.ioc_common.construct_truthy(
+                            'vnet'
+                        )
+                    ) & iocage_lib.ioc_common.lowercase_set(self.props):
                         iocage_lib.ioc_common.logit({
                             'level': 'WARNING',
                             'message': 'accept_rtadv requires vnet,'
-                            ' setting to on!'
+                            ' enabling!'
                         },
                             _callback=self.callback,
                             silent=self.silent)
-                        config['vnet'] = 'on'
+                        config['vnet'] = 1
 
                     rtsold_enable = 'YES'
-            elif (key == 'dhcp' and value == 'on') or (
+            elif (key == 'dhcp' and is_true) or (
                 key == 'ip4_addr' and 'DHCP' in value.upper()
             ):
-                if 'vnet=on' not in self.props:
+                if not iocage_lib.ioc_common.lowercase_set(
+                    iocage_lib.ioc_common.construct_truthy(
+                        'vnet'
+                    )
+                ) & iocage_lib.ioc_common.lowercase_set(self.props):
                     iocage_lib.ioc_common.logit({
                         'level': 'WARNING',
-                        'message': 'dhcp requires vnet, setting to on!'
+                        'message': 'dhcp requires vnet, enabling!'
                     },
                         _callback=self.callback,
                         silent=self.silent)
-                    config['vnet'] = 'on'
-                if 'bpf=yes' not in self.props:
+                    config['vnet'] = 1
+                if not iocage_lib.ioc_common.lowercase_set(
+                    iocage_lib.ioc_common.construct_truthy(
+                        'bpf'
+                    )
+                ) & iocage_lib.ioc_common.lowercase_set(self.props):
                     iocage_lib.ioc_common.logit({
                         'level': 'WARNING',
-                        'message': 'dhcp requires bpf, setting to yes!'
+                        'message': 'dhcp requires bpf, enabling!'
                     },
                         _callback=self.callback,
                         silent=self.silent)
-                    config['bpf'] = 'yes'
-            elif key == 'bpf' and value == 'yes':
-                if 'vnet=on' not in self.props:
+                    config['bpf'] = 1
+            elif key == 'bpf' and is_true:
+                if not iocage_lib.ioc_common.lowercase_set(
+                    iocage_lib.ioc_common.construct_truthy(
+                        'vnet'
+                    )
+                ) & iocage_lib.ioc_common.lowercase_set(self.props):
                     iocage_lib.ioc_common.logit({
                         'level': 'WARNING',
-                        'message': 'bpf requires vnet, setting to on!'
+                        'message': 'bpf requires vnet, enabling!'
                     },
                         _callback=self.callback,
                         silent=self.silent)
-                    config['vnet'] = 'on'
+                    config['vnet'] = 1
+            elif key == 'assign_localhost' and is_true:
+                if iocage_lib.ioc_common.lowercase_set(
+                    iocage_lib.ioc_common.construct_truthy(
+                        'vnet'
+                    )
+                ) & iocage_lib.ioc_common.lowercase_set(self.props):
+                    iocage_lib.ioc_common.logit({
+                        'level': 'WARNING',
+                        'message': 'assign_localhost only applies to shared'
+                                   ' IP jails, disabling!'
+                    },
+                        _callback=self.callback,
+                        silent=self.silent)
+                    disable_localhost = True
+
+            if disable_localhost:
+                self.props = [p for p in self.props if not p.startswith(
+                    'assign_localhost') and not p.startswith('localhost_ip')]
+                if not self.thickconfig:
+                    try:
+                        del config['assign_localhost']
+                    except KeyError:
+                        # They may not have specified this
+                        pass
+
+                    try:
+                        del config['localhost_ip']
+                    except KeyError:
+                        # They may not have specified this
+                        pass
+                else:
+                    config['assign_localhost'] = 0
+                    config['localhost_ip'] = 0
 
             try:
                 value, config = iocjson.json_check_prop(key, value, config)
-
                 config[key] = value
             except RuntimeError as err:
                 iocjson.json_write(config)  # Destroy counts on this.
@@ -450,6 +498,8 @@ class IOCCreate(object):
                 iocage_lib.ioc_destroy.IOCDestroy().destroy_jail(location)
                 exit(1)
 
+        # We want these to represent reality on the FS
+        iocjson.fix_properties(config)
         if not self.plugin:
             # TODO: Should we probably only write once and maybe at the end
             # of the function ?
@@ -501,7 +551,29 @@ class IOCCreate(object):
 
                     for line in _etc_hosts.readlines():
                         if line.startswith("127.0.0.1"):
-                            line = f"{line.rstrip()} {jail_uuid_short}\n"
+                            if config.get(
+                                'assign_localhost'
+                            ) and not config.get('vnet'):
+                                l_ip = config.get('localhost_ip', 'none')
+                                l_ip = l_ip if l_ip != 'none' else \
+                                    iocage_lib.ioc_common.gen_unused_lo_ip()
+                                config['localhost_ip'] = l_ip
+                                iocjson.json_write(config)
+
+                                # If they are creating multiple jails, we want
+                                # this aliased before starting the  jail
+                                su.run(
+                                    [
+                                        'ifconfig', 'lo0', 'alias',
+                                        f'{l_ip}/32'
+                                    ]
+                                )
+
+                                line = f'{l_ip}\t\tlocalhost' \
+                                       ' localhost.my.domain' \
+                                       f' {jail_uuid_short}\n'
+                            else:
+                                line = f'{line.rstrip()} {jail_uuid_short}\n'
 
                         etc_hosts.write(line)
                     else:
@@ -536,7 +608,7 @@ class IOCCreate(object):
             self.create_rc(
                 location,
                 config["host_hostname"],
-                config.get('basejail', 'no')
+                config.get('basejail', 0)
             )
 
             if rtsold_enable == 'YES':
@@ -571,7 +643,7 @@ class IOCCreate(object):
                 iocage_lib.ioc_fstab.IOCFstab(jail_uuid, "add", source,
                                               destination, "nullfs", "ro", "0",
                                               "0", silent=True)
-                config["basejail"] = "yes"
+                config["basejail"] = 1
 
             iocjson.json_write(config)
 
@@ -589,9 +661,13 @@ class IOCCreate(object):
                 silent=self.silent)
 
         if self.pkglist:
-            if config.get('ip4_addr', 'none') == 'none' and \
-                config.get('ip6_addr', 'none') == 'none' and \
-                    config.get('dhcp', 'off') != 'on':
+            auto_config = config.get('dhcp') or \
+                config.get('ip_hostname') or \
+                config.get('nat')
+
+            if config.get('ip4_addr', 'none') == "none" and \
+                config.get('ip6_addr', 'none') == "none" and \
+                    not auto_config:
                 iocage_lib.ioc_common.logit({
                     "level": "WARNING",
                     "message": "You need an IP address for the jail to"
@@ -681,72 +757,73 @@ class IOCCreate(object):
                     _callback=self.callback,
                     silent=False)
 
-        # Connectivity test courtesy David Cottlehuber off Google Group
-        srv_connect_cmd = ["drill", "-t", f"_http._tcp.{repo} SRV"]
-        dnssec_connect_cmd = ["drill", "-D", f"{repo}"]
-        dns_connect_cmd = ["drill", f"{repo}"]
-
-        iocage_lib.ioc_common.logit({
-            "level": "INFO",
-            "message": f"Testing {jail_uuid}'s SRV response to {repo}"
-        },
-            _callback=self.callback,
-            silent=False)
-
-        try:
-            iocage_lib.ioc_exec.SilentExec(
-                srv_connect_cmd, location, uuid=jail_uuid, plugin=self.plugin
-            )
-        except iocage_lib.ioc_exceptions.CommandFailed:
-            # This shouldn't be fatal since SRV records are not required
-            iocage_lib.ioc_common.logit({
-                "level": "WARNING",
-                "message":
-                    f"{repo}'s SRV record could not be verified.\n"
-            },
-                _callback=self.callback,
-                silent=False)
-
-        iocage_lib.ioc_common.logit({
-            "level": "INFO",
-            "message": f"Testing {jail_uuid}'s DNSSEC response to {repo}"
-        },
-            _callback=self.callback,
-            silent=False)
-        try:
-            iocage_lib.ioc_exec.SilentExec(
-                dnssec_connect_cmd, location, uuid=jail_uuid,
-                plugin=self.plugin,
-            )
-        except iocage_lib.ioc_exceptions.CommandFailed:
-            # Not fatal, they may not be using DNSSEC
-            iocage_lib.ioc_common.logit({
-                "level": "WARNING",
-                "message": f"{repo} could not be reached via DNSSEC.\n"
-            },
-                _callback=self.callback,
-                silent=False)
+            # Connectivity test courtesy David Cottlehuber off Google Group
+            srv_connect_cmd = ["drill", "-t", f"_http._tcp.{repo} SRV"]
+            dnssec_connect_cmd = ["drill", "-D", f"{repo}"]
+            dns_connect_cmd = ["drill", f"{repo}"]
 
             iocage_lib.ioc_common.logit({
                 "level": "INFO",
-                "message": f"Testing {jail_uuid}'s DNS response to {repo}"
+                "message": f"Testing {jail_uuid}'s SRV response to {repo}"
             },
                 _callback=self.callback,
                 silent=False)
 
             try:
                 iocage_lib.ioc_exec.SilentExec(
-                    dns_connect_cmd, location, uuid=jail_uuid,
-                    plugin=self.plugin,
+                    srv_connect_cmd, location, uuid=jail_uuid,
+                    plugin=self.plugin
                 )
             except iocage_lib.ioc_exceptions.CommandFailed:
+                # This shouldn't be fatal since SRV records are not required
                 iocage_lib.ioc_common.logit({
-                    "level": "EXCEPTION",
-                    "message": f"{repo} could not be reached via DNS, check"
-                    f" {jail_uuid}'s network configuration"
+                    "level": "WARNING",
+                    "message":
+                        f"{repo}'s SRV record could not be verified.\n"
                 },
                     _callback=self.callback,
                     silent=False)
+
+            iocage_lib.ioc_common.logit({
+                "level": "INFO",
+                "message": f"Testing {jail_uuid}'s DNSSEC response to {repo}"
+            },
+                _callback=self.callback,
+                silent=False)
+            try:
+                iocage_lib.ioc_exec.SilentExec(
+                    dnssec_connect_cmd, location, uuid=jail_uuid,
+                    plugin=self.plugin,
+                )
+            except iocage_lib.ioc_exceptions.CommandFailed:
+                # Not fatal, they may not be using DNSSEC
+                iocage_lib.ioc_common.logit({
+                    "level": "WARNING",
+                    "message": f"{repo} could not be reached via DNSSEC.\n"
+                },
+                    _callback=self.callback,
+                    silent=False)
+
+                iocage_lib.ioc_common.logit({
+                    "level": "INFO",
+                    "message": f"Testing {jail_uuid}'s DNS response to {repo}"
+                },
+                    _callback=self.callback,
+                    silent=False)
+
+                try:
+                    iocage_lib.ioc_exec.SilentExec(
+                        dns_connect_cmd, location, uuid=jail_uuid,
+                        plugin=self.plugin,
+                    )
+                except iocage_lib.ioc_exceptions.CommandFailed:
+                    iocage_lib.ioc_common.logit({
+                        "level": "EXCEPTION",
+                        "message": f"{repo} could not be reached via DNS,"
+                        f" check {jail_uuid}'s network configuration"
+                    },
+                        _callback=self.callback,
+                        silent=False)
 
         if isinstance(self.pkglist, str):
             with open(self.pkglist, "r") as j:
@@ -767,6 +844,8 @@ class IOCCreate(object):
                                  stdout=su.PIPE,
                                  stderr=su.STDOUT)
             pkg_err = pkg_install.returncode
+
+            self.log.debug(pkg_install.stdout)
 
             if pkg_err == 0:
                 break
@@ -792,7 +871,13 @@ class IOCCreate(object):
                     _callback=self.callback)
 
         # We will have mismatched ABI errors from earlier, this is to be safe.
-        pkg_env = {"ASSUME_ALWAYS_YES": "yes"}
+        pkg_env = {
+            **{
+                k: os.environ.get(k)
+                for k in ['http_proxy', 'https_proxy'] if os.environ.get(k)
+            }
+            , "ASSUME_ALWAYS_YES": "yes"
+        }
         cmd = ("/usr/local/sbin/pkg-static", "upgrade", "-f", "-q", "-y")
         try:
             with iocage_lib.ioc_exec.IOCExec(
@@ -802,7 +887,7 @@ class IOCCreate(object):
                 iocage_lib.ioc_common.consume_and_log(
                     _exec,
                     callback=self.callback,
-                    log=not(self.silent)
+                    log=not self.silent
                 )
         except iocage_lib.ioc_exceptions.CommandFailed as e:
             iocage_lib.ioc_stop.IOCStop(jail_uuid, location, force=True,
@@ -889,7 +974,7 @@ class IOCCreate(object):
         if self.plugin and pkg_err_list:
             return ','.join(pkg_err_list)
 
-    def create_rc(self, location, host_hostname, basejail='no'):
+    def create_rc(self, location, host_hostname, basejail=0):
         """
         Writes a boilerplate rc.conf file for a jail if it doesn't exist,
          otherwise changes the hostname.
@@ -926,7 +1011,7 @@ ipv6_activate_all_interfaces=\"YES\"
         if not jail_rc_conf.is_file():
             shutil.copy(str(rc_conf), str(jail_rc_conf))
 
-        if basejail != 'no':
+        if basejail:
             su.Popen(
                 ['mount', '-F', f'{location}/fstab', '-a']).communicate()
 
@@ -934,7 +1019,7 @@ ipv6_activate_all_interfaces=\"YES\"
                   f'hostname={host_hostname.replace("_", "-")}'],
                  stdout=su.PIPE).communicate()
 
-        if basejail != 'no':
+        if basejail:
             su.Popen(
                 ['umount', '-F', f'{location}/fstab', '-a']).communicate()
 
@@ -954,6 +1039,10 @@ ipv6_activate_all_interfaces=\"YES\"
             )
             su.check_call(
                 ['zfs', 'destroy', f'{source}@{jail_uuid}'],
+                stdout=su.PIPE
+            )
+            su.check_call(
+                ['zfs', 'destroy', f'{jail}/root@{jail_uuid}'],
                 stdout=su.PIPE
             )
         except su.CalledProcessError:

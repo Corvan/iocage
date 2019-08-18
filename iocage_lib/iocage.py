@@ -47,6 +47,8 @@ import iocage_lib.ioc_debug as ioc_debug
 import iocage_lib.ioc_exceptions as ioc_exceptions
 import libzfs
 
+from iocage_lib.release import Release
+
 
 class PoolAndDataset(ioc_json.IOCZFS):
 
@@ -188,7 +190,7 @@ class IOCage(ioc_json.IOCZFS):
 
             # This removes having to grab all the JSON again later.
 
-            if boot == 'on':
+            if boot:
                 boot_order[jail] = int(priority)
 
             jail_order = collections.OrderedDict(
@@ -519,7 +521,8 @@ class IOCage(ioc_json.IOCZFS):
                empty=False,
                clone=None,
                skip_batch=False,
-               thickconfig=False):
+               thickconfig=False,
+               clone_basejail=False):
         """Creates the jail dataset"""
         count = 0 if count == 1 and not skip_batch else count
 
@@ -628,7 +631,8 @@ class IOCage(ioc_json.IOCZFS):
                         empty=empty,
                         clone=clone,
                         skip_batch=True,
-                        thickconfig=thickconfig)
+                        thickconfig=thickconfig,
+                        clone_basejail=clone_basejail)
             else:
                 ioc_create.IOCCreate(
                     release,
@@ -643,9 +647,17 @@ class IOCage(ioc_json.IOCZFS):
                     empty=empty,
                     uuid=_uuid,
                     clone=clone,
-                    thickconfig=thickconfig
+                    thickconfig=thickconfig,
+                    clone_basejail=clone_basejail
                 ).create_jail()
-        except RuntimeError:
+        except BaseException:
+            if clone:
+                su.run(
+                    [
+                        'zfs', 'destroy', '-r',
+                        f'{self.pool}/iocage/jails/{clone}@{_uuid}'
+                    ]
+                )
             raise
 
         return False, None
@@ -654,7 +666,7 @@ class IOCage(ioc_json.IOCZFS):
         """Destroy supplied RELEASE and the download dataset if asked"""
         path = f"{self.pool}/iocage/releases/{self.jail}"
 
-        release = ioc_json.Release(self.jail)
+        release = Release(self.jail)
         # Let's make sure the release exists before we try to destroy it
         if not release:
             ioc_common.logit({
@@ -686,7 +698,7 @@ class IOCage(ioc_json.IOCZFS):
             ioc_destroy.IOCDestroy().__destroy_parse_datasets__(path,
                                                                 stop=False)
 
-    def destroy_jail(self, force):
+    def destroy_jail(self, force=False):
         """
         Destroys the supplied jail, to reduce perfomance hit,
         call IOCage with skip_jails=True
@@ -799,15 +811,31 @@ class IOCage(ioc_json.IOCZFS):
 
         return jail_list
 
-    def exec(self,
-             command,
-             host_user="root",
-             jail_user=None,
-             console=False,
-             interactive=False,
-             unjailed=False,
-             msg_return=False):
+    def exec_all(
+        self, command, host_user='root', jail_user=None, console=False,
+        start_jail=False, interactive=False, unjailed=False, msg_return=False
+    ):
+        """Runs exec for all jails"""
+        self._all = False
+        for jail in self.jails:
+            self.jail = jail
+            self.exec(
+                command, host_user, jail_user, console, start_jail,
+                interactive, unjailed, msg_return
+            )
+
+    def exec(
+        self, command, host_user='root', jail_user=None, console=False,
+        start_jail=False, interactive=False, unjailed=False, msg_return=False
+    ):
         """Executes a command in the jail as the supplied users."""
+        if self._all:
+            self.exec_all(
+                command, host_user, jail_user, console, start_jail,
+                interactive, unjailed, msg_return
+            )
+            return
+
         pkg = unjailed
 
         if host_user and jail_user is not None:
@@ -823,7 +851,7 @@ class IOCage(ioc_json.IOCZFS):
         uuid, path = self.__check_jail_existence__()
         exec_clean = self.get('exec_clean')
 
-        if exec_clean == '1':
+        if exec_clean:
             env_path = '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:' \
                 '/usr/local/bin:/root/bin'
             env_lang = os.environ.get('LANG', 'en_US.UTF-8')
@@ -838,12 +866,40 @@ class IOCage(ioc_json.IOCZFS):
         else:
             su_env = os.environ.copy()
 
+        status, jid = self.list("jid", uuid=uuid)
+
+        if not status and not start_jail:
+            if not ioc_common.INTERACTIVE:
+                ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": f'{self.jail} is not running! Please supply'
+                                   ' start_jail=True or start the jail'
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
+            else:
+                ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": f'{self.jail} is not running! Please supply'
+                                   ' --force (-f) or start the jail'
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
+        elif not status:
+            self.start()
+            status, jid = self.list("jid", uuid=uuid)
+
         if pkg:
             ip4_addr = self.get("ip4_addr")
             ip6_addr = self.get("ip6_addr")
             dhcp = self.get("dhcp")
+            nat = self.get('nat')
 
-            if ip4_addr == "none" and ip6_addr == "none" and dhcp != "on":
+            if (
+                ip4_addr == ip6_addr == "none" and not dhcp and not nat
+            ):
                 ioc_common.logit(
                     {
                         "level":
@@ -855,19 +911,25 @@ class IOCage(ioc_json.IOCZFS):
                     _callback=self.callback,
                     silent=self.silent)
 
-            status, jid = self.list("jid", uuid=uuid)
-
-            if not status:
-                self.start()
-                status, jid = self.list("jid", uuid=uuid)
-
             command = ["pkg", "-j", jid] + list(command)
 
         if console:
             login_flags = self.get('login_flags').split()
             console_cmd = ['login', '-p'] + login_flags
 
-            ioc_exec.InteractiveExec(console_cmd, path, uuid=uuid)
+            try:
+                ioc_exec.InteractiveExec(console_cmd, path, uuid=uuid)
+            except BaseException as e:
+                ioc_common.logit(
+                    {
+                        'level': 'ERROR',
+                        'message': 'Console failed!\nThe cause could be bad '
+                                   f'permissions for {path}/root/usr/lib.'
+                    },
+                    _callback=self.callback,
+                    silent=False
+                )
+                raise e
             return
 
         if interactive:
@@ -891,14 +953,14 @@ class IOCage(ioc_json.IOCZFS):
                 unjailed=pkg,
                 su_env=su_env
             ) as _exec:
-                msgs = ioc_common.consume_and_log(
+                output = ioc_common.consume_and_log(
                     _exec
                 )
 
                 if msg_return:
-                    return msgs
+                    return output['stdout']
 
-                for line in msgs:
+                for line in output['stdout']:
                     ioc_common.logit(
                         {
                             "level": "INFO",
@@ -925,7 +987,7 @@ class IOCage(ioc_json.IOCZFS):
                     _callback=self.callback,
                     silent=self.silent)
 
-    def export(self):
+    def export(self, compression_algo='zip'):
         """Will export a jail"""
         uuid, path = self.__check_jail_existence__()
         status, _ = self.list("jid", uuid=uuid)
@@ -942,7 +1004,9 @@ class IOCage(ioc_json.IOCZFS):
                 _callback=self.callback,
                 silent=self.silent)
 
-        ioc_image.IOCImage().export_jail(uuid, path)
+        ioc_image.IOCImage().export_jail(
+            uuid, path, compression_algo=compression_algo
+        )
 
     def fetch(self, **kwargs):
         """Fetches a release or plugin."""
@@ -950,7 +1014,7 @@ class IOCage(ioc_json.IOCZFS):
         name = kwargs.pop("name", None)
         props = kwargs.pop("props", ())
         plugins = kwargs.pop("plugins", False)
-        plugin_file = kwargs.pop("plugin_file", False)
+        plugin_name = kwargs.pop("plugin_name", None)
         count = kwargs.pop("count", 1)
         accept = kwargs.pop("accept", False)
         _list = kwargs.pop("list", False)
@@ -991,7 +1055,7 @@ class IOCage(ioc_json.IOCZFS):
             else:
                 kwargs["hardened"] = False
 
-        if plugins or plugin_file:
+        if plugins or plugin_name:
             ip = [
                 x for x in props
 
@@ -1001,7 +1065,8 @@ class IOCage(ioc_json.IOCZFS):
             if _list:
                 rel_list = ioc_plugin.IOCPlugin(
                     branch=branch,
-                    thickconfig=thick_config
+                    thickconfig=thick_config,
+                    **kwargs
                 ).fetch_plugin_index(
                     "", _list=True, list_header=header, list_long=_long,
                     icon=True, official=official
@@ -1009,7 +1074,15 @@ class IOCage(ioc_json.IOCZFS):
 
                 return rel_list
 
-            if not ip and "dhcp=on" not in props:
+            if not ip and (not ioc_common.lowercase_set(
+                ioc_common.construct_truthy('dhcp')
+            ) & ioc_common.lowercase_set(
+                props) and not ioc_common.lowercase_set(
+                    ioc_common.construct_truthy('ip_hostname')
+            ) & ioc_common.lowercase_set(
+                props) and not ioc_common.lowercase_set(
+                    ioc_common.construct_truthy('nat')
+            ) & ioc_common.lowercase_set(props)):
                 ioc_common.logit(
                     {
                         "level":
@@ -1025,7 +1098,7 @@ class IOCage(ioc_json.IOCZFS):
             if plugins:
                 ioc_plugin.IOCPlugin(
                     release=release,
-                    plugin=name,
+                    plugin=plugin_name,
                     branch=branch,
                     thickconfig=thick_config,
                     **kwargs).fetch_plugin_index(
@@ -1033,24 +1106,53 @@ class IOCage(ioc_json.IOCZFS):
 
                 return
 
+            plugin_obj = ioc_plugin.IOCPlugin(
+                release=release, plugin=plugin_name,
+                branch=branch, silent=self.silent,
+                keep_jail_on_failure=keep_jail_on_failure,
+                callback=self.callback, **kwargs,
+                thickconfig=thick_config,
+            )
+
+            i = 1
+            check_jail_name = name or plugin_obj.retrieve_plugin_json().get(
+                'name', plugin_name
+            )
+            while True:
+                if check_jail_name not in self.jails:
+                    jail_name = check_jail_name
+                    break
+                elif f'{check_jail_name}_{i}' not in self.jails:
+                    jail_name = f'{check_jail_name}_{i}'
+                    break
+                i += 1
+
+            self.jails[jail_name] = jail_name   # Not a valid value
             if count == 1:
-                ioc_plugin.IOCPlugin(
-                    release=release, branch=branch,
-                    silent=self.silent,
-                    keep_jail_on_failure=keep_jail_on_failure,
-                    callback=self.callback, **kwargs,
-                    thickconfig=thick_config,
-                ).fetch_plugin(name, props, 0, accept)
+                plugin_obj.jail = jail_name
+                plugin_obj.fetch_plugin(props, 0, accept)
             else:
                 for j in range(1, count + 1):
-                    ioc_plugin.IOCPlugin(
-                        release=release, branch=branch,
-                        silent=self.silent,
-                        keep_jail_on_failure=keep_jail_on_failure,
-                        thickconfig=thick_config,
-                        callback=self.callback, **kwargs
-                    ).fetch_plugin(name, props, j, accept)
+                    # Repeating this block in case they have gaps in their
+                    # plugins
+                    # Allows plugin_1, plugin_2, and such to happen instead of
+                    # plugin_1_1, plugin_1_2
+                    while True:
+                        if jail_name not in self.jails:
+                            break
+                        elif f'{check_jail_name}_{i}' not in self.jails:
+                            jail_name = f'{check_jail_name}_{i}'
+                            break
+
+                        i += 1
+
+                    self.jails[jail_name] = jail_name   # Not a valid value
+                    plugin_obj.jail = jail_name
+                    plugin_obj.fetch_plugin(props, j, accept)
         else:
+            kwargs.pop('git_repository', None)
+            kwargs.pop('git_destination', None)
+
             if _list:
                 if remote:
                     rel_list = ioc_fetch.IOCFetch(
@@ -1095,15 +1197,6 @@ class IOCage(ioc_json.IOCZFS):
                     },
                     _callback=self.callback,
                     silent=self.silent)
-        else:
-            _fstab_list = []
-            index = 0
-
-            with open(f"{self.iocroot}/jails/{uuid}/fstab", "r") as _fstab:
-                for line in _fstab.readlines():
-                    line = line.rsplit("#")[0].rstrip()
-                    _fstab_list.append([index, line.replace("\t", " ")])
-                    index += 1
 
         if action == "list":
             fstab = ioc_fstab.IOCFstab(
@@ -1117,7 +1210,6 @@ class IOCage(ioc_json.IOCZFS):
                 _pass,
                 index=index,
                 header=header,
-                _fstab_list=_fstab_list
             ).fstab_list()
 
             return fstab
@@ -1134,8 +1226,19 @@ class IOCage(ioc_json.IOCZFS):
                 index=index
             )
 
-    def get(self, prop, recursive=False, plugin=False, pool=False):
+    def get(
+        self, prop, recursive=False, plugin=False, pool=False, start_jail=False
+    ):
         """Get a jail property"""
+        if start_jail and not plugin:
+            ioc_common.logit(
+                {
+                    'level': 'EXCEPTION',
+                    'message':
+                        '--force (-f) is only applicable with --plugin (-P)!'
+                },
+                _callback=self.callback,
+                silent=self.silent)
 
         if pool:
             return self.pool
@@ -1162,10 +1265,33 @@ class IOCage(ioc_json.IOCZFS):
             if prop == "state":
                 return state
             elif plugin:
+                if not status and not start_jail:
+                    if not ioc_common.INTERACTIVE:
+                        ioc_common.logit(
+                            {
+                                "level": "EXCEPTION",
+                                "message": f'{self.jail} is not running!'
+                                           ' Please supply start_jail=True or'
+                                           ' start the jail'
+                            },
+                            _callback=self.callback,
+                            silent=self.silent)
+                    else:
+                        ioc_common.logit(
+                            {
+                                "level": "EXCEPTION",
+                                "message": f'{self.jail} is not running!'
+                                           ' Please supply --force (-f) or'
+                                           ' start the jail'
+                            },
+                            _callback=self.callback,
+                            silent=self.silent)
+
                 try:
                     _prop = prop.split(".")
                     props = ioc_json.IOCJson(path).json_plugin_get_value(
-                        _prop)
+                        _prop
+                    )
                 except ioc_exceptions.CommandNeedsRoot as err:
                     ioc_common.logit(
                         {
@@ -1262,9 +1388,11 @@ class IOCage(ioc_json.IOCZFS):
 
             return jail_list
 
-    def import_(self):
+    def import_(self, compression_algo='zip', path=None):
         """Imports a jail"""
-        ioc_image.IOCImage().import_jail(self.jail)
+        ioc_image.IOCImage().import_jail(
+            self.jail, compression_algo=compression_algo, path=path
+        )
 
     def list(self,
              lst_type,
@@ -1460,7 +1588,7 @@ class IOCage(ioc_json.IOCZFS):
                 _callback=self.callback,
                 silent=self.silent)
 
-        if conf["template"] == "yes":
+        if ioc_common.check_truthy(conf['template']):
             target = f"{self.pool}/iocage/templates/{uuid}"
         else:
             target = f"{self.pool}/iocage/jails/{uuid}"
@@ -1558,9 +1686,11 @@ class IOCage(ioc_json.IOCZFS):
             return
 
         if "template" in key:
-            if prop == "template=yes" and path.startswith(
-                    f"{self.iocroot}/templates/"):
-
+            if prop in ioc_common.construct_truthy(
+                'template'
+            ) and path.startswith(
+                f'{self.iocroot}/templates/'
+            ):
                 ioc_common.logit(
                     {
                         "level": "EXCEPTION",
@@ -1569,9 +1699,11 @@ class IOCage(ioc_json.IOCZFS):
                     _callback=self.callback,
                     silent=self.silent)
 
-            elif prop == "template=no" and path.startswith(
-                    f"{self.iocroot}/jails/"):
-
+            elif prop in ioc_common.construct_truthy(
+                'template', inverse=True
+            ) and path.startswith(
+                f'{self.iocroot}/jails/'
+            ):
                 ioc_common.logit(
                     {
                         "level": "EXCEPTION",
@@ -1609,7 +1741,7 @@ class IOCage(ioc_json.IOCZFS):
         snap_list_temp = []
         snap_list_root = []
 
-        if conf["template"] == "yes":
+        if ioc_common.check_truthy(conf['template']):
             full_path = f"{self.pool}/iocage/templates/{uuid}"
         else:
             full_path = f"{self.pool}/iocage/jails/{uuid}"
@@ -1675,7 +1807,7 @@ class IOCage(ioc_json.IOCZFS):
         # Looks like foo/iocage/jails/df0ef69a-57b6-4480-b1f8-88f7b6febbdf@BAR
         conf = ioc_json.IOCJson(path, silent=self.silent).json_get_value('all')
 
-        if conf["template"] == "yes":
+        if ioc_common.check_truthy(conf['template']):
             target = f"{self.pool}/iocage/templates/{uuid}"
         else:
             target = f"{self.pool}/iocage/jails/{uuid}"
@@ -1688,11 +1820,13 @@ class IOCage(ioc_json.IOCZFS):
             if err.code == libzfs.Error.EXISTS:
                 ioc_common.logit(
                     {
-                        "level": "EXCEPTION",
-                        "message": "Snapshot already exists!"
+                        'level': 'EXCEPTION',
+                        'message': 'Snapshot already exists!',
+                        'force_raise': True
                     },
                     _callback=self.callback,
-                    silent=self.silent)
+                    silent=self.silent,
+                    exception=ioc_exceptions.Exists)
             else:
                 raise ()
 
@@ -1746,7 +1880,7 @@ class IOCage(ioc_json.IOCZFS):
                 _callback=self.callback,
                 silent=self.silent)
 
-    def start(self, jail=None, ignore_exception=False):
+    def start(self, jail=None, ignore_exception=False, used_ports=None):
         """Checks jails type and existence, then starts the jail"""
         if self.rc or self._all:
             if not jail:
@@ -1796,7 +1930,8 @@ class IOCage(ioc_json.IOCZFS):
                     silent=self.silent,
                     callback=self.callback,
                     is_depend=self.is_depend,
-                    suppress_exception=ignore_exception
+                    suppress_exception=ignore_exception,
+                    used_ports=used_ports,
                 )
 
                 return False, None
@@ -1826,17 +1961,17 @@ class IOCage(ioc_json.IOCZFS):
                 force=force, suppress_exception=ignore_exception
             )
 
-    def update_all(self):
+    def update_all(self, pkgs=False):
         """Runs update for all jails"""
         self._all = False
         for jail in self.jails:
             self.jail = jail
-            self.update()
+            self.update(pkgs)
 
-    def update(self):
+    def update(self, pkgs=False):
         """Updates a jail to the latest patchset."""
         if self._all:
-            self.update_all()
+            self.update_all(pkgs)
             return
 
         uuid, path = self.__check_jail_existence__()
@@ -1853,6 +1988,11 @@ class IOCage(ioc_json.IOCZFS):
             "jail", "clonejail", "pluginv2") else False
 
         if updateable:
+            date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.snapshot(
+                f'ioc_update_{conf["release"]}_{date}'
+            )
+
             if not status:
                 self.silent = True
                 self.start()
@@ -1892,33 +2032,78 @@ class IOCage(ioc_json.IOCZFS):
                 self.stop()
                 self.silent = _silent
         else:
+            if pkgs and not (jail_type in ('plugin', 'pluginv2')):
+                # Let's update pkg repos first
+                ioc_common.logit({
+                    'level': 'INFO',
+                    'message': 'Updating pkgs...'
+                })
+                pkg_update = su.run(
+                    ['pkg-static', '-j', jid, 'update', '-q', '-f'],
+                    stdout=su.PIPE, stderr=su.STDOUT
+                )
+                if pkg_update.returncode:
+                    ioc_common.logit({
+                        'level': 'EXCEPTION',
+                        'message': 'Failed to update pkg repositories.'
+                    })
+                else:
+                    ioc_common.logit({
+                        'level': 'INFO',
+                        'message': 'Updated pkg repositories successfully.'
+                    })
+                # This will run pkg upgrade now
+                ioc_create.IOCCreate(
+                    self.jail, '', 0, pkglist=[],
+                    silent=True, callback=self.callback
+                ).create_install_packages(self.jail, path, repo='')
+
+                ioc_common.logit({
+                    'level': 'INFO',
+                    'message': 'Upgraded pkgs successfully.'
+                })
+
             if jail_type == "pluginv2" or jail_type == "plugin":
                 # TODO: Warn about erasing all pkgs
+                ioc_common.logit({
+                    'level': 'INFO',
+                    'message': 'Updating plugin...'
+                })
                 ioc_plugin.IOCPlugin(
-                    plugin=uuid,
+                    jail=uuid,
+                    plugin=conf['plugin_name'],
+                    git_repository=conf['plugin_repository'],
                     callback=self.callback
-                ).update()
-            elif conf["basejail"] != "yes":
-                new_release = ioc_fetch.IOCFetch(
-                    release,
-                    callback=self.callback
-                ).fetch_update(True, uuid)
+                ).update(jid)
+                ioc_common.logit({
+                    'level': 'INFO',
+                    'message': 'Updated plugin successfully.'
+                })
 
-                conf['release'] = new_release
-                ioc_json.IOCJson(path).json_write(conf)
-            else:
-                # Basejails only need their RELEASE updated
-                ioc_fetch.IOCFetch(
-                    release,
-                    callback=self.callback
-                ).fetch_update()
+            # Jail updates should always happen
+            ioc_common.logit({
+                'level': 'INFO',
+                'message': 'Updating jail...'
+            })
+
+            is_basejail = ioc_common.check_truthy(conf['basejail'])
+            params = [] if is_basejail else [True, uuid]
+            ioc_fetch.IOCFetch(
+                release,
+                callback=self.callback
+            ).fetch_update(*params)
+
+            ioc_common.logit({
+                'level': 'INFO',
+                'message': 'Updated jail successfully.'
+            })
 
             if started:
                 self.silent = True
                 self.stop()
                 self.silent = _silent
 
-            message = f"\n{uuid} has been updated successfully."
+            message = f"\n{uuid} updates have been applied successfully."
             ioc_common.logit(
                 {
                     "level": "INFO",
@@ -1996,7 +2181,7 @@ class IOCage(ioc_json.IOCZFS):
                 ioc_start.IOCStart(uuid, path, silent=True)
                 started = True
 
-            if conf["basejail"] == "yes":
+            if ioc_common.check_truthy(conf['basejail']):
                 new_release = ioc_upgrade.IOCUpgrade(
                     release,
                     root_path,
@@ -2035,9 +2220,11 @@ class IOCage(ioc_json.IOCZFS):
                 started = True
 
             new_release = ioc_plugin.IOCPlugin(
-                plugin=uuid,
+                jail=uuid,
+                plugin=conf['plugin_name'],
+                git_repository=conf['plugin_repository'],
                 callback=self.callback
-            ).upgrade()
+            ).upgrade(jid)
             plugin = True
         else:
             ioc_common.logit(
@@ -2085,7 +2272,7 @@ Remove the snapshot: ioc_upgrade_{_date} if everything is OK
         uuid, path = self.__check_jail_existence__()
         conf = ioc_json.IOCJson(path, silent=self.silent).json_get_value('all')
 
-        if conf['template'] == 'yes':
+        if ioc_common.check_truthy(conf['template']):
             target = f'{self.pool}/iocage/templates/{uuid}@{snapshot}'
         else:
             target = f'{self.pool}/iocage/jails/{uuid}@{snapshot}'

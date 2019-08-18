@@ -37,6 +37,7 @@ import sys
 import iocage_lib.ioc_common
 import iocage_lib.ioc_create
 import iocage_lib.ioc_exec
+import iocage_lib.ioc_fstab
 import iocage_lib.ioc_list
 import iocage_lib.ioc_stop
 import iocage_lib.ioc_exceptions as ioc_exceptions
@@ -162,6 +163,258 @@ class JailRuntimeConfiguration(object):
             )
 
 
+class IOCCpuset(object):
+
+    def __init__(self, name):
+        self.jail_name = f'ioc-{name}'
+
+    def set_cpuset(self, value=None):
+        if not value:
+            value = 'all'
+
+        failed = False
+        try:
+            iocage_lib.ioc_exec.SilentExec(
+                ['cpuset', '-l', value, '-j', self.jail_name],
+                None, unjailed=True, decode=True
+            )
+        except iocage_lib.ioc_exceptions.CommandFailed:
+            failed = True
+        finally:
+            return failed
+
+    @staticmethod
+    def retrieve_cpu_sets():
+        cpu_sets = -2
+        try:
+            output = iocage_lib.ioc_exec.SilentExec(
+                ['cpuset', '-g', '-s', '0'],
+                None, unjailed=True, decode=True
+            )
+        except iocage_lib.ioc_exceptions.CommandFailed:
+            pass
+        else:
+            result = re.findall(
+                r'.*mask:.*(\d+)$',
+                output.stdout.split('\n')[0]
+            )
+            if result:
+                cpu_sets = int(result[0])
+        finally:
+            return cpu_sets
+
+    @staticmethod
+    def validate_cpuset_prop(value, raise_error=True):
+        failed = False
+        cpu_sets = IOCCpuset.retrieve_cpu_sets() + 1
+        cpu_set_value_err = False
+
+        if not any(
+            cond for cond in (
+                re.findall(
+                    r'^(\d+(,\d+)*)$',
+                    value
+                ),
+                value in ('off', 'all'),
+                re.findall(
+                    r'^(\d+-\d+)$',
+                    value
+                )
+            )
+        ):
+            failed = True
+        elif not any(
+            cond for cond in (
+                re.findall(
+                    fr'^(?!.*(\b\d+\b).*\b\1\b)'
+                    fr'((?:{"|".join(map(str, range(cpu_sets)))})'
+                    fr'(,(?:{"|".join(map(str, range(cpu_sets)))}))*)?$',
+                    value
+                ),
+                value in ('off', 'all'),
+                re.findall(
+                    fr'^(?:{"|".join(map(str, range(cpu_sets - 1)))})-'
+                    fr'(?:{"|".join(map(str, range(cpu_sets)))})$',
+                    value
+                ) and int(value.split('-')[0]) < int(value.split('-')[1])
+            )
+        ):
+            cpu_set_value_err = True
+
+        if (failed or cpu_set_value_err) and raise_error:
+            message = 'Please specify a valid format for cpuset ' \
+                      'value.\nFollowing 4 formats are supported:\n' \
+                      '1) comma delimited string i.e 0,1,2,3\n' \
+                      '2) a range of values i.e 0-2\n' \
+                      '3) "all" - all would mean using all cores\n' \
+                      '4) off'
+            if cpu_set_value_err:
+                message = 'Please make sure the provided cpus fall in the ' \
+                          'correct range of cpus.\nFor this system it is: ' \
+                          f'{",".join(map(str, range(cpu_sets)))}'
+            iocage_lib.ioc_common.logit(
+                {
+                    'level': 'EXCEPTION',
+                    'message': message
+                }
+            )
+        else:
+            return failed | cpu_set_value_err
+
+
+class IOCRCTL(object):
+
+    types = {
+        'cputime', 'datasize', 'stacksize', 'coredumpsize',
+        'memoryuse', 'memorylocked', 'maxproc', 'openfiles',
+        'vmemoryuse', 'pseudoterminals', 'swapuse', 'nthr',
+        'msgqqueued', 'msgqsize', 'nmsgq', 'nsem', 'nsemop',
+        'nshm', 'shmsize', 'wallclock', 'pcpu', 'readbps',
+        'writebps', 'readiops', 'writeiops'
+    }
+
+    def __init__(self, name):
+        self.jail_name = f'ioc-{name}'
+
+    def set_rctl_rules(self, props):
+        # We expect props to be a list of tuples or a tuple
+        if not isinstance(props, list):
+            props = [props]
+
+        failed = set()
+        for key, value in props:
+            try:
+                iocage_lib.ioc_exec.SilentExec(
+                    [
+                        'rctl', '-a',
+                        f'jail:{self.jail_name}:{key}:{value}'
+                    ],
+                    None, unjailed=True, decode=True
+                )
+            except ioc_exceptions.CommandFailed:
+                failed.add(key)
+
+        return failed
+
+    def remove_rctl_rules(self, props=None):
+        if not props:
+            props = ['']
+
+        failed = set()
+        for prop in props:
+            try:
+                iocage_lib.ioc_exec.SilentExec(
+                    ['rctl', '-r', f'jail:{self.jail_name}:{prop}'],
+                    None, unjailed=True, decode=True
+                )
+            except ioc_exceptions.CommandFailed:
+                failed.add(prop if prop else 'ALL')
+
+        return failed
+
+    def rctl_rules_exist(self, prop=None):
+        rctl_enabled = False
+        try:
+            output = iocage_lib.ioc_exec.SilentExec(
+                ['rctl'],
+                None, unjailed=True, decode=True
+            )
+        except iocage_lib.ioc_exceptions.CommandFailed:
+            pass
+        else:
+            if f'jail:{self.jail_name}{"" if not prop else f":{prop}"}' \
+                    in output.stdout:
+                rctl_enabled = True
+        finally:
+            return rctl_enabled
+
+    @staticmethod
+    def validate_rctl_tunable():
+        rctl_enable = False
+        try:
+            output = iocage_lib.ioc_exec.SilentExec(
+                ['sysctl', 'kern.racct.enable'],
+                None, unjailed=True, decode=True
+            )
+        except ioc_exceptions.CommandFailed:
+            pass
+        else:
+            if re.findall(r'.*:.*1', output.stdout):
+                rctl_enable = True
+        finally:
+            if not rctl_enable:
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'EXCEPTION',
+                        'message': 'Please set kern.racct.enable -> 1 '
+                                   'to set rctl rules'
+                    }
+                )
+
+    @staticmethod
+    def validate_rctl_props(prop, value):
+        if prop in IOCRCTL.types and value != 'off':
+            # prop can have the following values
+            # off
+            # action=amount
+
+            IOCRCTL.validate_rctl_tunable()
+
+            if not re.findall(
+                r'(?:deny|log|devctl|sig\w*|throttle)=\d+(?:b|k|m|g|t|p|)$',
+                value, flags=re.IGNORECASE
+            ):
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'EXCEPTION',
+                        'message': 'Please supply a valid value for rctl '
+                        f'property {prop} following format '
+                        '"action=amount" or "off" where valid '
+                        'actions are "deny|log|devctl|sig*|throttle"'
+                    }
+                )
+            else:
+                if re.findall(
+                    r'(?:deny|log|devctl|sig\w*|throttle)=\d+(?:b|k|m|g|t|p)$',
+                    value, flags=re.IGNORECASE
+                ) and prop in (
+                    'cputime', 'maxproc', 'openfiles', 'pseudoterminals',
+                    'nthr', 'msgqqueued', 'nmsgq', 'nsem', 'nsemop', 'nshm',
+                    'wallclock', 'pcpu'
+                ):
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'EXCEPTION',
+                            'message': f'suffix {value[-1]} is not allowed '
+                            f'with {prop}'
+                        }
+                    )
+                action = value.split('=')[0]
+                if action == 'deny' and prop in (
+                    'cputime', 'wallclock', 'readbps', 'writebps',
+                    'readiops', 'writeiops'
+                ):
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'EXCEPTION',
+                            'message': 'Deny action is not supported with '
+                            f'prop {prop}'
+                        }
+                    )
+
+                if action == 'throttle' and prop not in (
+                    'readbps', 'writebps', 'readiops', 'writeiops'
+                ):
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'EXCEPTION',
+                            'message': 'Throttle action is only supported with'
+                            ' properties '
+                            '"readbps, writebps, readiops, writeiops"'
+                        }
+                    )
+
+
 class IOCSnapshot(object):
     # FIXME: Please move me to another file and let's see how we can build
     # our hierarchy for the whole ZFS related section
@@ -197,7 +450,7 @@ class IOCSnapshot(object):
             self.data = self.raw_data
 
         self.__dict__.update({
-            k: v for k, v in zip(self.attr_list, self.data.split())
+            k: v for k, v in zip(self.attr_list, self.data.split('\t'))
         })
 
     def delete(self, recursive=True):
@@ -228,19 +481,26 @@ class IOCZFS(object):
         self.zfs = libzfs.ZFS(history=True, history_prefix="<iocage>")
         self.callback = callback
 
-    @property
-    def iocroot_path(self):
+    def _iocroot(self, mountpoint=False):
         # For now we assume iocroot is set, however moving on we need to think
         # how best to structure this
         # We should give thought to how we handle
         for pool in self.pools:
-            if self.zfs_get_property(
-                pool, 'org.freebsd.ioc:active'
-            ) == 'yes':
-                return self.zfs_get_property(
-                    os.path.join(pool, 'iocage'),
-                    'mountpoint'
-                )
+            if self.zfs_get_property(pool, 'org.freebsd.ioc:active') == 'yes':
+                if mountpoint:
+                    return self.zfs_get_property(
+                        os.path.join(pool, 'iocage'), 'mountpoint'
+                    )
+                else:
+                    return os.path.join(pool, 'iocage')
+
+    @property
+    def iocroot_path(self):
+        return self._iocroot(mountpoint=True)
+
+    @property
+    def iocroot_dataset(self):
+        return self._iocroot()
 
     @property
     def pools(self):
@@ -366,12 +626,20 @@ class IOCZFS(object):
                 exception=ioc_exceptions.CommandFailed
             )
 
-    def zfs_get_dataset_and_dependents(self, identifier):
+    def zfs_get_dataset_and_dependents(self, identifier, depth=None):
+        id_depth = len(identifier.split('/'))
         try:
-            datasets = list(su.run(
-                ['zfs', 'list', '-rHo', 'name', identifier],
-                check=True, stdout=su.PIPE, stderr=su.PIPE
-            ).stdout.decode().split())
+            datasets = list(
+                filter(
+                    lambda p: p if not depth else len(
+                        p.split('/')
+                    ) - id_depth <= depth and len(p.split('/')) - id_depth,
+                    su.run(
+                        ['zfs', 'list', '-rHo', 'name', identifier],
+                        check=True, stdout=su.PIPE, stderr=su.PIPE
+                    ).stdout.decode().split()
+                )
+            )
         except su.CalledProcessError as e:
             iocage_lib.ioc_common.logit(
                 {
@@ -383,53 +651,8 @@ class IOCZFS(object):
                 _callback=self.callback,
                 exception=ioc_exceptions.CommandFailed
             )
-
-        return datasets
-
-
-class Resource(IOCZFS):
-    # TODO: Let's also rethink how best we should handle this in the future
-    def __init__(self, name):
-        super().__init__()
-        self.name = name
-
-    def __bool__(self):
-        return self.exists
-
-    def __hash__(self):
-        return hash(self.path)
-
-    def __repr__(self):
-        return str(self.name)
-
-    def __str__(self):
-        return str(self.name)
-
-    def __eq__(self, other):
-        return other.path == self.path
-
-    @property
-    def path(self):
-        raise NotImplementedError
-
-    @property
-    def exists(self):
-        return os.path.exists(self.path)
-
-
-class Release(Resource):
-    def __init__(self, name):
-        # We can expect the name to be either a full path or just the name of
-        # the release, let's normalize it
-        # a name can't contain "/". If it's a path, we can make a split and
-        # use the last name
-        super().__init__(name if '/' not in name else name.rsplit('/', 1)[1])
-
-    @property
-    def path(self):
-        return os.path.join(
-            self.iocroot_path, 'releases', self.name
-        )
+        else:
+            return datasets
 
 
 class IOCConfiguration(IOCZFS):
@@ -448,7 +671,7 @@ class IOCConfiguration(IOCZFS):
     @staticmethod
     def get_version():
         """Sets the iocage configuration version."""
-        version = '17'
+        version = '26'
 
         return version
 
@@ -586,7 +809,13 @@ class IOCConfiguration(IOCZFS):
             if mount != "none":
                 return mount
             else:
-                raise RuntimeError(f"Please set a mountpoint on {loc}")
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'EXCEPTION',
+                        'message': f'Please set a mountpoint on {loc}'
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
 
         return pool, get_iocroot()
 
@@ -611,7 +840,7 @@ class IOCConfiguration(IOCZFS):
         """Write a JSON file at the location given with supplied data."""
         # Templates need to be set r/w and then back to r/o
         try:
-            template = True if data['template'] != 'no' else False
+            template = iocage_lib.ioc_common.check_truthy(data['template'])
             jail_dataset = self.zfs.get_dataset_by_path(self.location).name \
                 if template else None
         except KeyError:
@@ -670,6 +899,59 @@ class IOCConfiguration(IOCZFS):
         if conf.get('ip6') == 'none':
             conf['ip6'] = 'disable'
 
+        for p, v in conf.items():
+            # We want these to rest on disk as 1/0
+            if p in self.truthy_props:
+                conf[p] = 1 if iocage_lib.ioc_common.check_truthy(v) else 0
+
+        if conf.get('type') in ('plugin', 'pluginv2'):
+            if conf.get('plugin_repository', 'none') == 'none':
+                conf['plugin_repository'] = \
+                    'https://github.com/freenas/iocage-ix-plugins.git'
+
+            if conf.get('plugin_name', 'none') == 'none':
+                jail_path = os.path.join(
+                    self.iocroot_path, 'jails', conf.get('host_hostuuid')
+                )
+
+                json_files = [
+                    f for f in os.listdir(jail_path)
+                    if f != 'config.json' and f.endswith('.json')
+                ]
+
+                if len(json_files) == 1:
+                    # It should be 1 only but if it isn't, this is unexpected
+                    # and we can't anticipate which file to use in this case
+                    try:
+                        with open(
+                            os.path.join(jail_path, json_files[0]), 'r'
+                        ) as f:
+                            plugin_data = json.loads(f.read())
+                    except json.JSONDecodeError:
+                        pass
+                    else:
+                        if plugin_data.get('name'):
+                            conf['plugin_name'] = plugin_data['name'].lower()
+                            # If this happens, we want to rename the
+                            # json file so it can be detected by iocage
+                            if plugin_data['name'] != json_files[0].rstrip(
+                                '.json'
+                            ):
+                                shutil.move(
+                                    os.path.join(jail_path, json_files[0]),
+                                    os.path.join(
+                                        jail_path,
+                                        f'{plugin_data["name"].lower()}.json'
+                                    )
+                                )
+
+            # This is our last resort - if above strategy didn't work,
+            # let's use host_hostuuid in this case
+            if conf.get('host_hostuuid') and conf.get(
+                'plugin_name', 'none'
+            ) == 'none':
+                conf['plugin_name'] = conf['host_hostuuid'].rsplit('_', 1)[0]
+
         return True if original_conf != conf else False
 
     def check_config(self, conf, default=False):
@@ -716,7 +998,7 @@ class IOCConfiguration(IOCZFS):
 
         # Version 4 keys
         if not conf.get('basejail'):
-            conf['basejail'] = 'no'
+            conf['basejail'] = 0
 
         # Version 5 keys
         if not conf.get('comment'):
@@ -724,7 +1006,7 @@ class IOCConfiguration(IOCZFS):
 
         # Version 6 keys
         if not conf.get('host_time'):
-            conf['host_time'] = 'yes'
+            conf['host_time'] = 1
 
         # Version 7 keys
         if not conf.get('depends'):
@@ -732,9 +1014,9 @@ class IOCConfiguration(IOCZFS):
 
         # Version 9 keys
         if not conf.get('dhcp'):
-            conf['dhcp'] = 'off'
+            conf['dhcp'] = 0
         if not conf.get('bpf'):
-            conf['bpf'] = 'no'
+            conf['bpf'] = 0
 
         # Version 10 keys
         if not conf.get('vnet_interfaces'):
@@ -742,11 +1024,11 @@ class IOCConfiguration(IOCZFS):
 
         # Version 11 keys
         if not conf.get('hostid_strict_check'):
-            conf['hostid_strict_check'] = 'off'
+            conf['hostid_strict_check'] = 0
 
         # Version 12 keys
         if not conf.get('allow_mlock'):
-            conf['allow_mlock'] = '0'
+            conf['allow_mlock'] = 0
 
         # Version 13 keys
         if not conf.get('vnet_default_interface'):
@@ -760,19 +1042,67 @@ class IOCConfiguration(IOCZFS):
 
         # Version 14 keys
         if not conf.get('allow_tun'):
-            conf['allow_tun'] = '0'
+            conf['allow_tun'] = 0
 
         # Version 15 keys
         if not conf.get('allow_mount_fusefs'):
-            conf['allow_mount_fusefs'] = '0'
+            conf['allow_mount_fusefs'] = 0
 
         # Version 16 keys
         if not conf.get('rtsold'):
-            conf['rtsold'] = 'off'
+            conf['rtsold'] = 0
 
         # Version 17 keys
         if not conf.get('allow_vmm'):
-            conf['allow_vmm'] = '0'
+            conf['allow_vmm'] = 0
+
+        # Version 18 keys
+        if not conf.get('ip_hostname'):
+            conf['ip_hostname'] = 0
+
+        # Version 19 keys
+        # RCTL Support added
+        conf.update(
+            {k: 'off' for k in IOCRCTL.types if not conf.get(k)}
+        )
+
+        # Version 20 keys
+        if not conf.get('exec_created'):
+            conf['exec_created'] = '/usr/bin/true'
+
+        # Version 21 keys
+        if not conf.get('assign_localhost'):
+            conf['assign_localhost'] = 0
+
+        # Version 22 keys
+        if not conf.get('localhost_ip'):
+            conf['localhost_ip'] = 'none'
+
+        # Version 23 keys
+        if not conf.get('nat'):
+            conf['nat'] = 0
+        if not conf.get('nat_prefix'):
+            conf['nat_prefix'] = '172.16'
+        if not conf.get('nat_interface'):
+            conf['nat_interface'] = 'none'
+        if not conf.get('nat_backend'):
+            conf['nat_backend'] = 'ipfw'
+        if not conf.get('nat_forwards'):
+            conf['nat_forwards'] = 'none'
+
+        # Version 24 key
+        if not conf.get('plugin_name'):
+            conf['plugin_name'] = 'none'
+
+        # Version 25 key
+        if not conf.get('plugin_repository'):
+            conf['plugin_repository'] = 'none'
+
+        # Version 26 keys
+        # Migrate defaultrouter and defaultrouter6 default 'none' to 'auto'
+        for option in ('defaultrouter', 'defaultrouter6'):
+            if conf.get(option) == 'none':
+                conf[option] = 'auto'
 
         if not default:
             conf.update(jail_conf)
@@ -784,10 +1114,11 @@ class IOCConfiguration(IOCZFS):
         Checks the jails configuration and migrates anything needed
         """
         release = conf.get('release', None)
-        template = conf.get('template', 'no')
+        template = conf.get('template', 0)
+        host_hostuuid = conf.get('host_hostuuid', None)
         renamed = False
 
-        if release is None:
+        if release is None or host_hostuuid is None:
             err_name = self.location.rsplit('/', 1)[-1]
             iocage_lib.ioc_common.logit(
                 {
@@ -801,36 +1132,41 @@ class IOCConfiguration(IOCZFS):
         release = release.rsplit('-p', 1)[0]
         cloned_release = conf.get('cloned_release', 'LEGACY_JAIL')
 
+        if iocage_lib.ioc_common.check_truthy(template):
+            freebsd_version_path = \
+                f'{self.iocroot}/templates/{conf["host_hostuuid"]}/root'
+        else:
+            freebsd_version_path = f'{self.iocroot}/jails/{host_hostuuid}/root'
+
         freebsd_version = pathlib.Path(
-            f'{self.iocroot}/releases/{release}/root/bin/freebsd-version'
+            f'{freebsd_version_path}/bin/freebsd-version'
         )
+
+        if not freebsd_version.is_file() and conf.get('basejail'):
+            # It is possible the basejail hasn't started yet. I believe
+            # the best case here is to parse fstab entries and determine
+            # which release is being used and check it for freebsd-version
+            for index, fstab_entry in iocage_lib.ioc_fstab.IOCFstab(
+                host_hostuuid, 'list',
+            ).fstab_list():
+                if fstab_entry[1].rstrip('/') == os.path.join(
+                    freebsd_version_path, 'bin'
+                ):
+                    freebsd_version = pathlib.Path(
+                        os.path.join(fstab_entry[0], 'freebsd-version')
+                    )
+                    freebsd_version_path = fstab_entry[0].rstrip('/').rsplit(
+                        '/', 1
+                    )[0]
+
         if not freebsd_version.is_file():
-            try:
-                if template == 'yes':
-                    freebsd_version = pathlib.Path(
-                        f'{self.iocroot}/templates/'
-                        f"{conf['host_hostuuid']}/root/bin/freebsd-version"
-                    )
-                else:
-                    temp_uuid = self.location.rsplit('/', 1)[-1]
-                    freebsd_version = pathlib.Path(
-                        f'{self.iocroot}/jails/{temp_uuid}/root/bin/'
-                        'freebsd-version'
-                    )
-                if not freebsd_version.is_file():
-                    iocage_lib.ioc_common.logit(
-                        {
-                            'level': 'EXCEPTION',
-                            'message': 'freebsd-version could not be found at'
-                            f' {freebsd_version}'
-                        }
-                    )
-            except KeyError:
-                # At this point it should be a real misconfigured jail
-                uuid = self.location.rsplit('/', 1)[-1]
-                raise RuntimeError('Configuration is missing!'
-                                   f' Please destroy {uuid} and recreate'
-                                   ' it.')
+            iocage_lib.ioc_common.logit(
+                {
+                    'level': 'EXCEPTION',
+                    'message': 'freebsd-version could not be found at'
+                    f' {freebsd_version}'
+                }
+            )
 
         if release[:4].endswith('-'):
             # 9.3-RELEASE and under don't actually have this binary.
@@ -839,18 +1175,17 @@ class IOCConfiguration(IOCZFS):
             pass
         else:
             try:
-                with open(freebsd_version, 'r') as r:
-                    for line in r:
-                        if line.startswith('USERLAND_VERSION'):
-                            release = line.rstrip().partition('=')[2]
-                            release = release.strip("'\"")
+                release = iocage_lib.ioc_common.get_jail_freebsd_version(
+                    freebsd_version_path, release
+                )
             except Exception as e:
                 iocage_lib.ioc_common.logit(
                     {
                         'level': 'EXCEPTION',
                         'message': 'Exception:'
-                        f" '{e.__class__.__name__}:{str(e)}' occured\n"
-                        f"Loading {uuid}'s configuration failed"
+                        f" '{e.__class__.__name__}:{str(e)}' occurred\n"
+                        f"Loading {host_hostuuid}'s "
+                        "configuration failed"
                     }
                 )
 
@@ -963,6 +1298,7 @@ class IOCConfiguration(IOCZFS):
         """This sets up the default configuration for jails."""
         default_json_location = f'{self.iocroot}/defaults.json'
         write = True  # Write the defaults file
+        fix_write = False
 
         try:
             with open('/etc/hostid', 'r') as _file:
@@ -981,8 +1317,8 @@ class IOCConfiguration(IOCZFS):
             'ip6_addr': 'none',
             'ip6_saddrsel': '1',
             'ip6': 'new',
-            'defaultrouter': 'none',
-            'defaultrouter6': 'none',
+            'defaultrouter': 'auto',
+            'defaultrouter6': 'auto',
             'resolver': '/etc/resolv.conf',
             'mac_prefix': self.mac_prefix,
             'vnet0_mac': 'none',
@@ -997,14 +1333,15 @@ class IOCConfiguration(IOCZFS):
             'exec_poststart': '/usr/bin/true',
             'exec_prestop': '/usr/bin/true',
             'exec_poststop': '/usr/bin/true',
-            'exec_clean': '1',
+            'exec_created': '/usr/bin/true',
+            'exec_clean': 1,
             'exec_timeout': '60',
             'stop_timeout': '30',
             'exec_jail_user': 'root',
             'exec_system_jail_user': '0',
             'exec_system_user': 'root',
-            'mount_devfs': '1',
-            'mount_fdescfs': '1',
+            'mount_devfs': 1,
+            'mount_fdescfs': 1,
             'enforce_statfs': '2',
             'children_max': '0',
             'login_flags': '-f root',
@@ -1012,22 +1349,22 @@ class IOCConfiguration(IOCZFS):
             'sysvmsg': 'new',
             'sysvsem': 'new',
             'sysvshm': 'new',
-            'allow_set_hostname': '1',
-            'allow_sysvipc': '0',
-            'allow_raw_sockets': '0',
-            'allow_chflags': '0',
-            'allow_mlock': '0',
-            'allow_mount': '0',
-            'allow_mount_devfs': '0',
-            'allow_mount_fusefs': '0',
-            'allow_mount_nullfs': '0',
-            'allow_mount_procfs': '0',
-            'allow_mount_tmpfs': '0',
-            'allow_mount_zfs': '0',
-            'allow_quotas': '0',
-            'allow_socket_af': '0',
-            'allow_tun': '0',
-            'allow_vmm': '0',
+            'allow_set_hostname': 1,
+            'allow_sysvipc': 0,
+            'allow_raw_sockets': 0,
+            'allow_chflags': 0,
+            'allow_mlock': 0,
+            'allow_mount': 0,
+            'allow_mount_devfs': 0,
+            'allow_mount_fusefs': 0,
+            'allow_mount_nullfs': 0,
+            'allow_mount_procfs': 0,
+            'allow_mount_tmpfs': 0,
+            'allow_mount_zfs': 0,
+            'allow_quotas': 0,
+            'allow_socket_af': 0,
+            'allow_tun': 0,
+            'allow_vmm': 0,
             'cpuset': 'off',
             'rlimits': 'off',
             'memoryuse': 'off',
@@ -1046,30 +1383,35 @@ class IOCConfiguration(IOCZFS):
             'msgqqueued': 'off',
             'msgqsize': 'off',
             'nmsgq': 'off',
+            'nsem': 'off',
             'nsemop': 'off',
             'nshm': 'off',
             'shmsize': 'off',
             'wallclock': 'off',
+            'readbps': 'off',
+            'writebps': 'off',
+            'readiops': 'off',
+            'writeiops': 'off',
             'type': 'jail',
-            'bpf': 'no',
-            'dhcp': 'off',
-            'boot': 'off',
+            'bpf': 0,
+            'dhcp': 0,
+            'boot': 0,
             'notes': 'none',
             'owner': 'root',
             'priority': '99',
             'last_started': 'none',
-            'template': 'no',
+            'template': 0,
             'hostid': hostid,
-            'hostid_strict_check': 'off',
-            'jail_zfs': 'off',
+            'hostid_strict_check': 0,
+            'jail_zfs': 0,
             'jail_zfs_mountpoint': 'none',
-            'mount_procfs': '0',
-            'mount_linprocfs': '0',
+            'mount_procfs': 0,
+            'mount_linprocfs': 0,
             'count': '1',
-            'vnet': 'off',
-            'basejail': 'no',
+            'vnet': 0,
+            'basejail': 0,
             'comment': 'none',
-            'host_time': 'yes',
+            'host_time': 1,
             'sync_state': 'none',
             'sync_target': 'none',
             'sync_tgt_zpool': 'none',
@@ -1084,7 +1426,17 @@ class IOCConfiguration(IOCZFS):
             'reservation': 'none',
             'depends': 'none',
             'vnet_interfaces': 'none',
-            'rtsold': 'off'
+            'rtsold': 0,
+            'ip_hostname': 0,
+            'assign_localhost': 0,
+            'localhost_ip': 'none',
+            'nat': 0,
+            'nat_prefix': '172.16',
+            'nat_interface': 'none',
+            'nat_backend': 'ipfw',
+            'nat_forwards': 'none',
+            'plugin_name': 'none',
+            'plugin_repository': 'none',
         }
 
         try:
@@ -1092,6 +1444,7 @@ class IOCConfiguration(IOCZFS):
                 default_props = json.load(default_json)
                 default_props, write = self.check_config(
                     default_props, default=True)
+                fix_write = self.fix_properties(default_props)
         except FileNotFoundError:
             iocage_lib.ioc_common.logit(
                 {
@@ -1122,7 +1475,7 @@ class IOCConfiguration(IOCZFS):
         finally:
             # They may have had new keys added to their default
             # configuration, or it never existed.
-            if write:
+            if write or fix_write:
                 self.json_write(default_props, default_json_location,
                                 defaults=True)
 
@@ -1148,6 +1501,44 @@ class IOCJson(IOCConfiguration):
         self.cli = cli
         self.stop = stop
         self.suppress_log = suppress_log
+        self.truthy_props = [
+            'bpf',
+            'template',
+            'host_time',
+            'basejail',
+            'dhcp',
+            'vnet',
+            'rtsold',
+            'jail_zfs',
+            'hostid_strict_check',
+            'boot',
+            'exec_clean',
+            'mount_linprocfs',
+            'mount_procfs',
+            'allow_vmm',
+            'allow_tun',
+            'allow_socket_af',
+            'allow_quotas',
+            'allow_mount_zfs',
+            'allow_mount_tmpfs',
+            'allow_mount_procfs',
+            'allow_mount_nullfs',
+            'allow_mount_fusefs',
+            'allow_mount_devfs',
+            'allow_mount',
+            'allow_mlock',
+            'allow_chflags',
+            'allow_raw_sockets',
+            'allow_sysvipc',
+            'allow_set_hostname',
+            'mount_fdescfs',
+            'mount_devfs',
+            'ip6_saddrsel',
+            'ip4_saddrsel',
+            'ip_hostname',
+            'assign_localhost',
+            'nat'
+        ]
         super().__init__(location, checking_datasets, silent, callback)
 
         try:
@@ -1163,12 +1554,31 @@ class IOCJson(IOCConfiguration):
     def get_full_config(self):
         d_conf = self.default_config
         conf, write = self.json_load()
-        write = self.fix_properties(conf)
+        fix_write = self.fix_properties(conf)
 
-        if write:
+        if write or fix_write:
             self.json_write(conf)
 
+        state, _ = iocage_lib.ioc_list.IOCList().list_get_jid(
+            conf['host_hostuuid'])
+
+        if state:
+            ruleset = su.check_output(
+                [
+                    'jls', '-j',
+                    f'ioc-{conf["host_hostuuid"].replace(".", "_")}',
+                    'devfs_ruleset'
+                ]
+            ).decode().rstrip()
+
+            conf['devfs_ruleset'] = ruleset
+
         d_conf.update(conf)
+
+        for p, v in d_conf.items():
+            # We want to make sure these are ints
+            if p in self.truthy_props:
+                d_conf[p] = iocage_lib.ioc_common.check_truthy(v)
 
         return d_conf
 
@@ -1221,7 +1631,7 @@ class IOCJson(IOCConfiguration):
                 if value == "basejail":
                     # These were just clones on master.
                     value = "jail"
-                    key_and_value["basejail"] = "yes"
+                    key_and_value["basejail"] = 1
             elif key == "hostname":
                 hostname = props[f'{prop_prefix}:host_hostname']
 
@@ -1309,15 +1719,15 @@ class IOCJson(IOCConfiguration):
             with open(self.location + "/config.json", "r") as conf:
                 conf = json.load(conf)
         except json.decoder.JSONDecodeError:
-                iocage_lib.ioc_common.logit(
-                    {
-                        'level': 'EXCEPTION',
-                        'message': f'{jail_uuid} has a corrupt configuration,'
-                        ' please fix this jail or destroy and recreate it.'
-                    },
-                    _callback=self.callback,
-                    silent=self.silent,
-                    exception=ioc_exceptions.JailCorruptConfiguration)
+            iocage_lib.ioc_common.logit(
+                {
+                    'level': 'EXCEPTION',
+                    'message': f'{jail_uuid} has a corrupt configuration,'
+                    ' please fix this jail or destroy and recreate it.'
+                },
+                _callback=self.callback,
+                silent=self.silent,
+                exception=ioc_exceptions.JailCorruptConfiguration)
         except FileNotFoundError:
             try:
                 # If this is a legacy jail, it will be missing this file but
@@ -1542,7 +1952,11 @@ class IOCJson(IOCConfiguration):
             conf, write = self.json_load()
             uuid = conf["host_hostuuid"]
             status, jid = iocage_lib.ioc_list.IOCList().list_get_jid(uuid)
-            conf[key] = value
+            # Convert truthy to int
+            if key in self.truthy_props:
+                conf[key] = iocage_lib.ioc_common.check_truthy(value)
+            else:
+                conf[key] = value
             sysctls_cmd = ["sysctl", "-d", "security.jail.param"]
             jail_param_regex = re.compile("security.jail.param.")
             sysctls_list = su.Popen(
@@ -1600,7 +2014,7 @@ class IOCJson(IOCConfiguration):
                                 _callback=self.callback,
                                 silent=self.silent)
 
-                if value == "yes":
+                if iocage_lib.ioc_common.check_truthy(value):
                     try:
                         jail_zfs_dataset = f"{self.pool}/" \
                             f"{conf['jail_zfs_dataset']}"
@@ -1645,23 +2059,13 @@ class IOCJson(IOCConfiguration):
                         silent=self.silent)
 
                     # Writing these now since the dataset will be readonly
-                    self.json_check_prop(key, value, conf)
+                    self.json_check_prop(key, value, conf, default)
                     self.json_write(conf)
-
-                    iocage_lib.ioc_common.logit(
-                        {
-                            "level":
-                            "INFO",
-                            "message":
-                            f"Property: {key} has been updated to {value}"
-                        },
-                        _callback=self.callback,
-                        silent=self.silent)
 
                     self.zfs_set_property(new_location, "readonly", "on")
 
                     return
-                elif value == "no":
+                else:
                     if not _import:
                         self.zfs.get_dataset(new_location).rename(
                             old_location, False, True)
@@ -1670,6 +2074,9 @@ class IOCJson(IOCConfiguration):
                             "/iocage", self.iocroot)
                         self.zfs_set_property(old_location, "readonly", "off")
 
+                        self.json_check_prop(key, value, conf, default)
+                        self.json_write(conf)
+
                         iocage_lib.ioc_common.logit(
                             {
                                 "level": "INFO",
@@ -1677,7 +2084,8 @@ class IOCJson(IOCConfiguration):
                             },
                             _callback=self.callback,
                             silent=self.silent)
-                        self.lgr.disabled = True
+
+                    return
 
             if key[:8] == "jail_zfs" or key == 'dhcp':
                 if status:
@@ -1697,11 +2105,16 @@ class IOCJson(IOCConfiguration):
         if not default:
             full_conf = self.get_full_config()
             value, conf = self.json_check_prop(key, value, conf)
+            old_value = full_conf[key] if key not in self.truthy_props else \
+                iocage_lib.ioc_common.check_truthy(full_conf[key])
+            display_value = value if key not in self.truthy_props else \
+                iocage_lib.ioc_common.check_truthy(value)
             self.json_write(conf)
+
             iocage_lib.ioc_common.logit(
                 {
                     "level": "INFO",
-                    "message": f"Property: {key} has been updated to {value}"
+                    "message": f'{key}: {old_value} -> {display_value}'
                 },
                 _callback=self.callback,
                 silent=self.silent)
@@ -1714,8 +2127,60 @@ class IOCJson(IOCConfiguration):
                 else:
                     key = key.replace("_", ".")
 
+                if key == 'cpuset':
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'INFO',
+                            'message': 'cpuset changes '
+                                       'require a jail restart'
+                        },
+                        _callback=self.callback,
+                        silent=self.silent
+                    )
+
+                # Let's set a rctl rule for the prop if applicable
+                if key in IOCRCTL.types:
+                    rctl_jail = IOCRCTL(conf['host_hostuuid'])
+                    rctl_jail.validate_rctl_tunable()
+
+                    if value != 'off':
+                        failed = rctl_jail.set_rctl_rules(
+                            (key, value)
+                        )
+                        if failed:
+                            msg = f'Failed to set RCTL rule for {key}'
+                        else:
+                            msg = f'Successfully set RCTL rule for {key}'
+
+                        iocage_lib.ioc_common.logit(
+                            {
+                                'level': 'INFO',
+                                'message': msg
+                            },
+                            _callback=self.callback,
+                            silent=self.silent
+                        )
+                    else:
+                        if rctl_jail.rctl_rules_exist(key):
+                            failed = rctl_jail.remove_rctl_rules([key])
+                            if failed:
+                                msg = f'Failed to remove RCTL ' \
+                                    f'rule for {key}'
+                            else:
+                                msg = 'Successfully removed RCTL ' \
+                                    f'rule for {key}'
+
+                            iocage_lib.ioc_common.logit(
+                                {
+                                    'level': 'INFO',
+                                    'message': msg
+                                },
+                                _callback=self.callback,
+                                silent=self.silent
+                            )
+
                 if key in jail_params:
-                    if full_conf["vnet"] == "on" and (
+                    if full_conf['vnet'] and (
                         key == "ip4.addr" or key == "ip6.addr"
                     ):
                         return
@@ -1748,6 +2213,9 @@ class IOCJson(IOCConfiguration):
                             f"{err.output.decode('utf-8').rstrip()}")
         else:
             if key in conf:
+                value, conf = self.json_check_prop(
+                    key, value, conf, default=True
+                )
                 conf[key] = value
                 self.json_write(conf, "/defaults.json")
 
@@ -1769,11 +2237,15 @@ class IOCJson(IOCConfiguration):
                     _callback=self.callback,
                     silent=self.silent)
 
-    def json_check_prop(self, key, value, conf):
+    def json_check_prop(self, key, value, conf, default=False):
         """
         Checks if the property matches known good values, if it's the
         CLI, deny setting any properties not in this list.
         """
+        truth_variations = (
+            '0', '1', 'off', 'on', 'no', 'yes', 'false', 'true'
+        )
+
         props = {
             # Network properties
             "interfaces": (":", ","),
@@ -1781,12 +2253,10 @@ class IOCJson(IOCConfiguration):
             "host_hostname": ("string", ),
             "exec_fib": ("string", ),
             "ip4_addr": ("string", ),
-            "ip4_saddrsel": (
-                "0",
-                "1", ),
+            "ip4_saddrsel": truth_variations,
             "ip4": ("new", "inherit", "disable"),
             "ip6_addr": ("string", ),
-            "ip6_saddrsel": ("0", "1"),
+            "ip6_saddrsel": truth_variations,
             "ip6": ("new", "inherit", "disable"),
             "defaultrouter": ("string", ),
             "defaultrouter6": ("string", ),
@@ -1804,14 +2274,15 @@ class IOCJson(IOCConfiguration):
             "exec_poststart": ("string", ),
             "exec_prestop": ("string", ),
             "exec_poststop": ("string", ),
-            "exec_clean": ("0", "1"),
+            "exec_clean": truth_variations,
+            "exec_created": ("string", ),
             "exec_timeout": ("string", ),
             "stop_timeout": ("string", ),
             "exec_jail_user": ("string", ),
             "exec_system_jail_user": ("string", ),
             "exec_system_user": ("string", ),
-            "mount_devfs": ("0", "1"),
-            "mount_fdescfs": ("0", "1"),
+            "mount_devfs": truth_variations,
+            "mount_fdescfs": truth_variations,
             "enforce_statfs": ("0", "1", "2"),
             "children_max": ("string", ),
             "login_flags": ("string", ),
@@ -1819,67 +2290,82 @@ class IOCJson(IOCConfiguration):
             "sysvmsg": ("new", "inherit", "disable"),
             "sysvsem": ("new", "inherit", "disable"),
             "sysvshm": ("new", "inherit", "disable"),
-            "allow_set_hostname": ("0", "1"),
-            "allow_sysvipc": ("0", "1"),
-            "allow_raw_sockets": ("0", "1"),
-            "allow_chflags": ("0", "1"),
-            "allow_mlock": ("0", "1"),
-            "allow_mount": ("0", "1"),
-            "allow_mount_devfs": ("0", "1"),
-            "allow_mount_fusefs": ("0", "1"),
-            "allow_mount_nullfs": ("0", "1"),
-            "allow_mount_procfs": ("0", "1"),
-            "allow_mount_tmpfs": ("0", "1"),
-            "allow_mount_zfs": ("0", "1"),
-            "allow_quotas": ("0", "1"),
-            "allow_socket_af": ("0", "1"),
-            "allow_vmm": ("0", "1"),
+            "allow_set_hostname": truth_variations,
+            "allow_sysvipc": truth_variations,
+            "allow_raw_sockets": truth_variations,
+            "allow_chflags": truth_variations,
+            "allow_mlock": truth_variations,
+            "allow_mount": truth_variations,
+            "allow_mount_devfs": truth_variations,
+            "allow_mount_fusefs": truth_variations,
+            "allow_mount_nullfs": truth_variations,
+            "allow_mount_procfs": truth_variations,
+            "allow_mount_tmpfs": truth_variations,
+            "allow_mount_zfs": truth_variations,
+            "allow_quotas": truth_variations,
+            "allow_socket_af": truth_variations,
+            "allow_vmm": truth_variations,
             "vnet_interfaces": ("string", ),
             # RCTL limits
-            "cpuset": ("off", "on"),
+            "cpuset": ('string',),
             "rlimits": ("off", "on"),
-            "memoryuse": ":",
-            "memorylocked": ("off", "on"),
-            "vmemoryuse": ("off", "on"),
-            "maxproc": ("off", "on"),
-            "cputime": ("off", "on"),
-            "pcpu": ":",
-            "datasize": ("off", "on"),
-            "stacksize": ("off", "on"),
-            "coredumpsize": ("off", "on"),
-            "openfiles": ("off", "on"),
-            "pseudoterminals": ("off", "on"),
-            "swapuse": ("off", "on"),
-            "nthr": ("off", "on"),
-            "msgqqueued": ("off", "on"),
-            "msgqsize": ("off", "on"),
-            "nmsgq": ("off", "on"),
-            "nsemop": ("off", "on"),
-            "nshm": ("off", "on"),
-            "shmsize": ("off", "on"),
-            "wallclock": ("off", "on"),
+            "memoryuse": ('string',),
+            "memorylocked": ('string',),
+            "vmemoryuse": ('string',),
+            "maxproc": ('string',),
+            "cputime": ('string',),
+            "pcpu": ('string',),
+            "datasize": ('string',),
+            "stacksize": ('string',),
+            "coredumpsize": ('string',),
+            "openfiles": ('string',),
+            "pseudoterminals": ('string',),
+            "swapuse": ('string',),
+            "nthr": ('string',),
+            "msgqqueued": ('string',),
+            "msgqsize": ('string',),
+            "nmsgq": ('string',),
+            "nsem": ('string',),
+            "nsemop": ('string',),
+            "nshm": ('string',),
+            "shmsize": ('string',),
+            "wallclock": ('string',),
+            "readbps": ('string',),
+            "writebps": ('string',),
+            "readiops": ('string',),
+            "writeiops": ('string',),
             # Custom properties
-            "bpf": ("no", "yes"),
-            "dhcp": ("off", "on"),
-            "boot": ("off", "on"),
+            "bpf": truth_variations,
+            "dhcp": truth_variations,
+            "boot": truth_variations,
             "notes": ("string", ),
             "owner": ("string", ),
             "priority": str(tuple(range(1, 100))),
             "hostid": ("string", ),
-            "hostid_strict_check": ("off", "on"),
-            "jail_zfs": ("off", "on"),
+            "hostid_strict_check": truth_variations,
+            "jail_zfs": truth_variations,
             "jail_zfs_dataset": ("string", ),
             "jail_zfs_mountpoint": ("string", ),
-            "mount_procfs": ("0", "1"),
-            "mount_linprocfs": ("0", "1"),
-            "vnet": ("off", "on"),
+            "mount_procfs": truth_variations,
+            "mount_linprocfs": truth_variations,
+            "vnet": truth_variations,
             "vnet_default_interface": ("string",),
-            "template": ("no", "yes"),
+            "template": truth_variations,
             "comment": ("string", ),
-            "host_time": ("no", "yes"),
+            "host_time": truth_variations,
             "depends": ("string", ),
-            "allow_tun": ("0", "1"),
-            'rtsold': ('off', 'on')
+            "allow_tun": truth_variations,
+            'rtsold': truth_variations,
+            'ip_hostname': truth_variations,
+            'assign_localhost': truth_variations,
+            'localhost_ip': ('string', ),
+            'nat': truth_variations,
+            'nat_prefix': ('string', ),
+            'nat_interface': ('string', ),
+            'nat_backend': ('pf', 'ipfw'),
+            'nat_forwards': ('string', ),
+            'plugin_name': ('string', ),
+            'plugin_repository': ('string', ),
         }
 
         zfs_props = {
@@ -1895,8 +2381,38 @@ class IOCJson(IOCConfiguration):
             "reservation": "none",
         }
 
+        if key in (
+            'nat_prefix', 'nat_interface', 'nat_backend'
+        ):
+            if not default:
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'EXCEPTION',
+                        'message': f'{key} can only be changed for defaults!'
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
+
+            active_nat_jails = iocage_lib.ioc_common.get_jails_with_config(
+                lambda j: (j['state'] == 'up' and j['nat'])
+            )
+            active_jails_msg = '\n'.join(
+                f'   - {jail}' for jail in active_nat_jails
+            )
+            if active_nat_jails:
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'EXCEPTION',
+                        'message': f'{key} cannot be changed with active '
+                        'NAT jails. Please stop the following active jails.\n'
+                        f'{active_jails_msg}'
+                    }
+                )
+
         if key in zfs_props.keys():
-            if conf.get("template", "no") == "yes":
+            if iocage_lib.ioc_common.check_truthy(
+                conf.get('template', '0')
+            ):
                 _type = "templates"
             else:
                 _type = "jails"
@@ -1924,16 +2440,38 @@ class IOCJson(IOCConfiguration):
         elif key in props.keys():
             # Either it contains what we expect, or it's a string.
 
+            if props[key] == truth_variations:
+                if key in ('nat', 'bpf'):
+                    other_key = 'nat' if key == 'bpf' else 'bpf'
+                    if (
+                        iocage_lib.ioc_common.check_truthy(value) and
+                        iocage_lib.ioc_common.check_truthy(conf.get(other_key))
+                    ):
+                        iocage_lib.ioc_common.logit(
+                            {
+                                'level': 'EXCEPTION',
+                                'message': f'{other_key} should be disabled '
+                                f'when {key} is being enabled.'
+                            }
+                        )
+
             for k in props[key]:
-                if k in value:
+                if k in value.lower():
                     return value, conf
 
             if props[key][0] == 'string':
-                if key in ('ip4_addr', 'ip6_addr') and value != 'none':
+                if key in (
+                    'ip4_addr', 'ip6_addr'
+                ) and (
+                    value != 'none' and 'DHCP' not in value.upper() and
+                    'accept_rtadv' not in value.lower()
+                ):
                     # There are three possible formats here
                     # 1 - interface|ip/subnet
                     # 2 - interface|ip
                     # 3 - ip
+                    # 4 - interface|DHCP
+                    # 5 - interface|accept_rtadv
                     # All the while of course assuming that we can
                     # have more then one ip
                     if key == 'ip4_addr':
@@ -2008,7 +2546,7 @@ class IOCJson(IOCConfiguration):
                                 {
                                     'level': 'EXCEPTION',
                                     'message':
-                                    'Please Enter two valid and different '
+                                    'Please enter two valid and different '
                                     'space/comma-delimited MAC addresses for '
                                     f'{key}.'
                                 },
@@ -2032,6 +2570,81 @@ class IOCJson(IOCConfiguration):
                             _callback=self.callback,
                             silent=self.silent
                         )
+                elif key in IOCRCTL.types:
+                    IOCRCTL.validate_rctl_props(key, value)
+                elif key == 'cpuset':
+                    IOCCpuset.validate_cpuset_prop(value)
+                elif key == 'localhost_ip':
+                    if value != 'none':
+                        try:
+                            ipaddress.IPv4Address(value)
+                        except ipaddress.AddressValueError as e:
+                            iocage_lib.ioc_common.logit(
+                                {
+                                    'level': 'EXCEPTION',
+                                    'message': f'Invalid IPv4 address: {e}'
+                                },
+                                _callback=self.callback,
+                                silent=self.silent
+                            )
+                elif key == 'nat_forwards':
+                    new_value = []
+
+                    if value != 'none':
+                        regex = re.compile(
+                            r'^(tcp|udp|tcp\/udp)\(\d{1,5}((:|-?)(\d{1,5}))\)'
+                        )
+                        for fwd in value.split(','):
+                            # We assume TCP for simpler inputs
+                            fwd = f'tcp({fwd})' if fwd.isdigit() else fwd
+                            new_value.append(fwd)
+
+                            match = regex.match(fwd)
+                            if not match or len(fwd) != match.span()[1]:
+                                iocage_lib.ioc_common.logit(
+                                    {
+                                        'level': 'EXCEPTION',
+                                        'message': f'Invalid nat_forwards'
+                                                   f' value: {value}'
+                                    },
+                                    _callback=self.callback,
+                                    silent=self.silent,
+                                    exception=ioc_exceptions.ValidationFailed
+                                )
+
+                        if new_value:
+                            value = ','.join(new_value)
+                            conf[key] = value
+                elif key == 'nat_prefix':
+                    if value != 'none':
+                        try:
+                            ip = ipaddress.IPv4Address(f'{value}.0.0')
+
+                            if not ip.is_private:
+                                iocage_lib.ioc_common.logit(
+                                    {
+                                        'level': 'EXCEPTION',
+                                        'message': f'Invalid nat_prefix value:'
+                                                   f' {value}\n'
+                                                   'Must be a private range'
+                                    },
+                                    _callback=self.callback,
+                                    silent=self.silent,
+                                    exception=ioc_exceptions.ValidationFailed
+                                )
+                        except ipaddress.AddressValueError:
+                            iocage_lib.ioc_common.logit(
+                                {
+                                    'level': 'EXCEPTION',
+                                    'message': f'Invalid nat_prefix value:'
+                                               f' {value}\n'
+                                               'Supply the first two octets'
+                                               ' only (XXX.XXX)'
+                                },
+                                _callback=self.callback,
+                                silent=self.silent,
+                                exception=ioc_exceptions.ValidationFailed
+                            )
 
                 return value, conf
             else:
@@ -2123,11 +2736,11 @@ class IOCJson(IOCConfiguration):
                         uuid=uuid,
                         plugin=True
                     ) as _exec:
-                        prop_out = iocage_lib.ioc_common.consume_and_log(
+                        output = iocage_lib.ioc_common.consume_and_log(
                             _exec,
                             log=False
                         )
-                        return prop_out[0]
+                        return output['stdout'][0] if output['stdout'] else ''
             else:
                 return settings
         except KeyError:
@@ -2377,7 +2990,7 @@ class IOCJson(IOCConfiguration):
                             line.replace(f'hostname="{uuid}"',
                                          f'hostname="{tag}"').rstrip())
 
-                    if conf["basejail"] == "yes":
+                    if iocage_lib.ioc_common.check_truthy(conf["basejail"]):
                         for line in fileinput.input(
                                 f"{self.iocroot}/jails/{tag}/fstab",
                                 inplace=1):

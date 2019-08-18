@@ -23,6 +23,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 """List all datasets by type"""
 import json
+import netifaces
 import os
 import re
 import subprocess as su
@@ -80,7 +81,18 @@ class IOCList(object):
 
             for jail in ds:
                 uuid = jail.name.rsplit("/", 1)[-1]
-                jails[uuid] = jail.properties["mountpoint"].value
+                try:
+                    jails[uuid] = jail.properties["mountpoint"].value
+                except KeyError:
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'ERROR',
+                            'message': f'{jail.name} mountpoint is '
+                            'misconfigured. Please correct this.'
+                        },
+                        _callback=self.callback,
+                        silent=self.silent
+                    )
 
             template_datasets = self.zfs.get_dataset(
                 f"{self.pool}/iocage/templates")
@@ -101,7 +113,19 @@ class IOCList(object):
         jail_list = []
 
         for jail in jails:
-            mountpoint = jail.properties["mountpoint"].value
+            try:
+                mountpoint = jail.properties["mountpoint"].value
+            except KeyError:
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'ERROR',
+                        'message': f'{jail.name} mountpoint is misconfigured. '
+                        'Please correct this.'
+                    },
+                    _callback=self.callback,
+                    silent=self.silent
+                )
+                continue
 
             try:
                 with open(f"{mountpoint}/config.json", "r") as loc:
@@ -126,11 +150,13 @@ class IOCList(object):
 
             uuid = conf["host_hostuuid"]
             ip4 = conf.get('ip4_addr', 'none')
-            dhcp = True if conf.get('dhcp') == 'on' or 'DHCP' in \
-                ip4.upper() else False
+            dhcp = True if iocage_lib.ioc_common.check_truthy(
+                conf.get('dhcp', 0)) or 'DHCP' in ip4.upper() else False
             ip4 = ip4 if not dhcp else 'DHCP'
 
-            if self.basejail_only and conf.get('basejail', 'no') != 'yes':
+            if self.basejail_only and not iocage_lib.ioc_common.check_truthy(
+                conf.get('basejail', 0)
+            ):
                 continue
 
             jail_list.append([uuid, ip4])
@@ -159,7 +185,20 @@ class IOCList(object):
         jail_list = []
 
         for jail in jails:
-            mountpoint = jail.properties["mountpoint"].value
+            try:
+                mountpoint = jail.properties["mountpoint"].value
+            except KeyError:
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'ERROR',
+                        'message': f'{jail.name} mountpoint is misconfigured. '
+                        'Please correct this.'
+                    },
+                    _callback=self.callback,
+                    silent=self.silent
+                )
+                continue
+
             try:
                 conf = iocage_lib.ioc_json.IOCJson(mountpoint).json_get_value(
                     'all'
@@ -183,7 +222,9 @@ class IOCList(object):
                 state = 'CORRUPT'
                 jid = '-'
 
-            if self.basejail_only and conf.get('basejail', 'no') != 'yes':
+            if self.basejail_only and not iocage_lib.ioc_common.check_truthy(
+                conf.get('basejail', 0)
+            ):
                 continue
 
             uuid_full = conf["host_hostuuid"]
@@ -209,10 +250,12 @@ class IOCList(object):
             except IndexError:
                 short_ip4 = full_ip4 if full_ip4 != "none" else "-"
 
-            boot = conf["boot"]
+            boot = 'on' if iocage_lib.ioc_common.check_truthy(
+                conf.get('boot', 0)) else 'off'
             jail_type = conf["type"]
             full_release = conf["release"]
-            basejail = conf.get('basejail', 'no')
+            basejail = 'yes' if iocage_lib.ioc_common.check_truthy(
+                conf.get('basejail', 0)) else 'no'
 
             if "HBSD" in full_release:
                 full_release = re.sub(r"\W\w.", "-", full_release)
@@ -253,7 +296,9 @@ class IOCList(object):
             if "release" in template.lower() or "stable" in template.lower():
                 template = "-"
 
-            if conf["dhcp"] == "on" and status and os.geteuid() == 0:
+            if iocage_lib.ioc_common.check_truthy(
+                conf['dhcp']
+            ) and status and os.geteuid() == 0:
                 interface = conf["interfaces"].split(",")[0].split(":")[0]
 
                 if interface == "vnet0":
@@ -273,10 +318,14 @@ class IOCList(object):
                         full_ip4 = f'DHCP - Network Issue: {e}'
                     else:
                         full_ip4 = f'DHCP - Failed Parsing: {e}'
-            elif conf["dhcp"] == "on" and not status:
+            elif iocage_lib.ioc_common.check_truthy(
+                conf['dhcp']
+            ) and not status:
                 short_ip4 = "DHCP"
                 full_ip4 = "DHCP (not running)"
-            elif conf["dhcp"] == "on" and os.geteuid() != 0:
+            elif iocage_lib.ioc_common.check_truthy(
+                conf['dhcp']
+            ) and os.geteuid() != 0:
                 short_ip4 = "DHCP"
                 full_ip4 = "DHCP (running -- address requires root)"
 
@@ -291,24 +340,49 @@ class IOCList(object):
 
                 try:
                     with open(f"{mountpoint}/plugin/ui.json", "r") as u:
-                        ip = full_ip4.split("|", 1)
-                        ip = ip[1] if len(ip) != 1 else ip[0]
+                        if not conf.get('nat'):
+                            all_ips = map(
+                                lambda v: 'DHCP' if 'dhcp' in v.lower() else v,
+                                [
+                                    i.split('|')[-1].split('/')[0].strip()
+                                    for i in full_ip4.split(',')
+                                ]
+                            )
+                        else:
+                            default_gateways = \
+                                iocage_lib.ioc_common.get_host_gateways()
 
-                        ip = ip.split("/", 1)[0] if "DHCP" not in full_ip4 \
-                            else "DHCP"
+                            all_ips = [
+                                f['addr']
+                                for k in default_gateways
+                                if default_gateways[k]['interface']
+                                for f in netifaces.ifaddresses(
+                                    default_gateways[k]['interface']
+                                )[netifaces.AF_INET
+                                    if k == 'ipv4' else netifaces.AF_INET6]
+                            ]
+
                         ui_data = json.load(u)
                         admin_portal = ui_data["adminportal"]
-                        admin_portal = admin_portal.replace("%%IP%%", ip)
+                        admin_portal = ','.join(
+                            map(
+                                lambda v: admin_portal.replace('%%IP%%', v),
+                                all_ips
+                            )
+                        )
 
                         try:
                             ph = ui_data["adminportal_placeholders"].items()
-                            for placeholder, prop in ph:
-                                admin_portal = admin_portal.replace(
-                                    placeholder,
-                                    iocage_lib.ioc_json.IOCJson(
-                                        mountpoint).json_plugin_get_value(
-                                        prop.split("."))
-                                )
+                            if ph and not status:
+                                admin_portal = f"{uuid} is not running!"
+                            else:
+                                for placeholder, prop in ph:
+                                    admin_portal = admin_portal.replace(
+                                        placeholder,
+                                        iocage_lib.ioc_json.IOCJson(
+                                            mountpoint).json_plugin_get_value(
+                                            prop.split("."))
+                                    )
                         except KeyError:
                             pass
                         except iocage_lib.ioc_exceptions.CommandNeedsRoot:
@@ -316,13 +390,15 @@ class IOCList(object):
                         except iocage_lib.ioc_exceptions.CommandFailed as e:
                             admin_portal = b' '.join(e.message).decode()
 
+                        doc_url = ui_data.get('docurl', '-')
+
                 except FileNotFoundError:
                     # They just didn't set a admin portal.
-                    admin_portal = "-"
+                    admin_portal = doc_url = '-'
 
                 jail_list.append([jid, uuid, boot, state, jail_type,
                                   full_release, full_ip4, ip6, template,
-                                  admin_portal])
+                                  admin_portal, doc_url])
             elif self.full:
                 jail_list.append([jid, uuid, boot, state, jail_type,
                                   full_release, full_ip4, ip6, template,
@@ -348,11 +424,11 @@ class IOCList(object):
         if self.full:
             if self.plugin:
                 table.set_cols_dtype(["t", "t", "t", "t", "t", "t", "t", "t",
-                                      "t", "t"])
+                                      "t", "t", "t"])
 
                 jail_list.insert(0, ["JID", "NAME", "BOOT", "STATE", "TYPE",
                                      "RELEASE", "IP4", "IP6", "TEMPLATE",
-                                     "PORTAL"])
+                                     "PORTAL", "DOC_URL"])
             else:
                 # We get an infinite float otherwise.
                 table.set_cols_dtype(["t", "t", "t", "t", "t", "t", "t", "t",

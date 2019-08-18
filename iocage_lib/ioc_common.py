@@ -30,16 +30,20 @@ import os
 import shutil
 import stat
 import subprocess as su
-import sys
 import tempfile as tmp
 import requests
 import datetime as dt
 import re
 import shlex
 import glob
+import netifaces
+import concurrent.futures
+import json
 
 import iocage_lib.ioc_exceptions
 import iocage_lib.ioc_exec
+
+INTERACTIVE = False
 
 
 def callback(_log, callback_exception):
@@ -65,26 +69,22 @@ def callback(_log, callback_exception):
     elif level == 'NOTICE':
         log.log(25, message)
     elif level == 'EXCEPTION':
-        try:
-            if not os.isatty(sys.stdout.fileno()):
+        if not INTERACTIVE:
+            raise callback_exception(message)
+        else:
+            if not isinstance(message, str) and isinstance(
+                message,
+                collections.Iterable
+            ):
+                message = '\n'.join(message)
+
+            if not suppress_log:
+                log.error(message)
+
+            if force_raise:
                 raise callback_exception(message)
             else:
-                if not isinstance(message, str) and isinstance(
-                    message,
-                    collections.Iterable
-                ):
-                    message = '\n'.join(message)
-
-                if not suppress_log:
-                    log.error(message)
-
-                if force_raise:
-                    raise callback_exception(message)
-                else:
-                    raise SystemExit(1)
-        except AttributeError:
-            # They are lacking the fileno object
-            raise callback_exception(message)
+                raise SystemExit(1)
 
 
 def logit(content, _callback=None, silent=False, exception=RuntimeError):
@@ -353,7 +353,7 @@ def sort_boot(boot):
     """Sort the list by boot, then by name."""
     # Lame hack to get on above off.
     # 0 is on, 1 is off
-    _boot = 0 if boot[2] != "off" else 1
+    _boot = 0 if check_truthy(boot[2]) else 1
     return (_boot,) + get_name_sortkey(boot[1])
 
 
@@ -777,11 +777,11 @@ def generate_devfs_ruleset(conf, paths=None, includes=None, callback=None,
         devfs_dict.update(paths)
 
     # We may end up setting all of these.
-    if conf['allow_mount_fusefs'] == '1':
+    if check_truthy(conf['allow_mount_fusefs']):
         devfs_dict['fuse'] = None
-    if conf['bpf'] == 'yes':
+    if check_truthy(conf['bpf']):
         devfs_dict['bpf*'] = None
-    if conf['allow_tun'] == '1':
+    if check_truthy(conf['allow_tun']):
         devfs_dict['tun*'] = None
 
     for include in devfs_includes:
@@ -867,26 +867,44 @@ def consume_and_log(exec_gen, log=True, callback=None):
     """
     Consume a generator and massage the output with lines
     """
-    final_output = ''
     output_list = []
+    error_list = []
+    stdout = stderr = ''
 
-    for stdout, _ in exec_gen:
-        final_output += stdout.decode()
+    def append_and_log(output):
+        for i, v in enumerate(output):
+            if v.endswith('\n'):
+                a_list = error_list if i else output_list
+                a_list.append(v)
 
-        if not final_output.endswith('\n'):
-            continue
+                if log:
+                    logit(
+                        {
+                            'level': 'INFO',
+                            'message': v.rstrip()
+                        },
+                        _callback=callback
+                    )
 
-        output_list.append(final_output.rstrip())
+                output[i] = ''
 
-        if log:
-            logit({
-                "level": "INFO",
-                "message": final_output.rstrip()
-            },
-                _callback=callback)
-        final_output = ''
+        return output
 
-    return output_list
+    for output in filter(lambda o: any(v for v in o), exec_gen):
+        output = list(output)
+        if isinstance(output[0], bytes):
+            for i in range(len(output)):
+                output[i] = output[i].decode()
+
+        o, e = output
+        stdout += o
+        stderr += e
+
+        stdout, stderr = append_and_log([stdout, stderr])
+
+    append_and_log([stdout, stderr])
+
+    return {'stdout': output_list, 'stderr': error_list}
 
 
 def get_jail_freebsd_version(path, release):
@@ -895,10 +913,186 @@ def get_jail_freebsd_version(path, release):
         # 9.3-RELEASE and under don't actually have this binary
         new_release = release
     else:
-        with open(f'{path}/bin/freebsd-version', 'r') as r:
+        with open(
+            f'{path}/bin/freebsd-version', mode='r', encoding='utf-8'
+        ) as r:
             for line in r:
                 if line.startswith('USERLAND_VERSION'):
                     new_release = line.rstrip().partition('=')[
                         2].strip('"')
 
     return new_release
+
+
+def check_truthy(value):
+    """Checks if the given value is 'True'"""
+    if str(value).lower() in ('1', 'on', 'yes', 'true'):
+        return 1
+
+    return 0
+
+
+def construct_truthy(item, inverse=False):
+    """Will return an iterable with all truthy variations"""
+    if inverse:
+        return (f'{item}=off', f'{item}=no', f'{item}=0', f'{item}=false')
+
+    return (f'{item}=on', f'{item}=yes', f'{item}=1', f'{item}=true')
+
+
+def set_interactive(interactive):
+    """Returns True or False if stdout is a tty"""
+    global INTERACTIVE
+    INTERACTIVE = interactive
+
+
+def lowercase_set(values):
+    return set([v.lower() for v in values])
+
+
+def gen_unused_lo_ip():
+    """Best effort to try to allocate a localhost IP for a jail"""
+    interface_addrs = netifaces.ifaddresses('lo0')
+    inuse = [ip['addr'] for ips in interface_addrs.values() for ip in ips
+             if ip['addr'].startswith('127')]
+
+    for ip in ipaddress.IPv4Network('127.0.0.0/8'):
+        ip_exploded = ip.exploded
+
+        if ip_exploded == '127.0.0.0':
+            continue
+
+        if ip_exploded not in inuse:
+            return ip_exploded
+
+    logit(
+        {
+            'level': 'EXCEPTION',
+            'message': 'An unused RFC5735 compliant localhost address could'
+            ' not be allocated.\nIf you wish to use a non-RFC5735 compliant'
+            ' address, please manually set the localhost_ip property.'
+        }
+    )
+
+
+def gen_nat_ip(ip_prefix):
+    """Best effort to try to allocate a private NAT IP for a jail"""
+    inuse = get_used_ips()
+
+    for i in range(256):
+        for l in range(1, 256, 4):
+            network = ipaddress.IPv4Network(
+                f'{ip_prefix}.{i}.{l}/30', strict=False
+            )
+            pair = [_ip.exploded for _ip in network.hosts()]
+
+            if any(x in pair for x in inuse):
+                continue
+
+            return pair
+
+    logit(
+        {
+            'level': 'EXCEPTION',
+            'message': 'An unused RFC1918 compliant address could'
+            ' not be allocated.\nPlease set an unused nat_prefix.'
+        }
+    )
+
+
+def get_used_ips():
+    """
+    Run ifconfig in every jail and return an iteratable of the inuse addresses
+    """
+    jails = json.loads(
+        su.run(
+            ['jls', 'jid', '--libxo', 'json'], stdout=su.PIPE, stderr=su.PIPE
+        ).stdout
+    )['jail-information']['jail']
+    addresses = []
+
+    # Host
+    inuse = su.run(
+        ['ifconfig'], stdout=su.PIPE, stderr=su.PIPE, universal_newlines=True
+    )
+    for line in inuse.stdout.splitlines():
+        if line.strip().startswith('inet'):
+            address = line.split()[1]
+            addresses.append(address)
+
+    # Jails
+    with concurrent.futures.ThreadPoolExecutor() as exc:
+        futures = exc.map(
+            lambda jail: su.run(
+                ['jexec', jail['jid'], 'ifconfig'], stdout=su.PIPE,
+                stderr=su.PIPE, universal_newlines=True
+            ), jails
+        )
+
+        for future in futures:
+            for line in future.stdout.splitlines():
+                if line.strip().startswith('inet'):
+                    address = line.split()[1]
+                    addresses.append(address)
+
+    return addresses
+
+
+def parse_package_name(pkg):
+    pkg, version = pkg.rsplit('-', 1)
+    epoch_split = version.rsplit(',', 1)
+    epoch = epoch_split[1] if len(epoch_split) == 2 else '0'
+    revision_split = epoch_split[0].rsplit('_', 1)
+    revision = \
+        revision_split[1] if len(revision_split) == 2 else '0'
+    return {
+        'version': revision_split[0],
+        'revision': revision,
+        'epoch': epoch,
+    }
+
+
+def get_host_gateways():
+    gateways = {'ipv4': {'gateway': None, 'interface': None},
+                'ipv6': {'gateway': None, 'interface': None}}
+    af_mapping = {
+        'Internet': 'ipv4',
+        'Internet6': 'ipv6'
+    }
+    output = checkoutput(['netstat', '-r', '-n', '--libxo', 'json'])
+    route_families = (json.loads(output)
+                      ['statistics']
+                      ['route-information']
+                      ['route-table']
+                      ['rt-family'])
+    for af in af_mapping.keys():
+        route_entries = list(filter(
+            lambda x: x['address-family'] == af, route_families)
+        )[0]['rt-entry']
+        default_route = list(filter(
+            lambda x: x['destination'] == 'default', route_entries)
+        )
+        if default_route and 'gateway' in default_route[0]:
+            gateways[af_mapping[af]]['gateway'] = \
+                default_route[0]['gateway']
+            gateways[af_mapping[af]]['interface'] = \
+                default_route[0]['interface-name']
+    return gateways
+
+
+def get_jails_with_config(filters=None, mapping_func=None):
+    # FIXME: Due to how api is structured, there is no good place to put this
+    #  so when we move on with restructuring the api, let's remove this as well
+    #  importing iocage_lib.iocage above gives us a circular dep due to how
+    #  iocage designates iocage_lib.iocage at top and imports everything else
+    #  within.
+    import iocage_lib.iocage
+    return {
+        j['host_hostuuid']: j if not mapping_func else mapping_func(j)
+        for j in map(
+            lambda v: list(v.values())[0],
+            iocage_lib.iocage.IOCage(jail=None).get(
+                'all', recursive=True
+            )
+        ) if not filters or filters(j)
+    }
